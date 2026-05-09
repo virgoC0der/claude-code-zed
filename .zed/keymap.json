@@ -1,0 +1,11 @@
+[
+  {
+    "context": "Editor",
+    "bindings": {
+      "cmd-alt-shift-c": [
+        "task::Spawn",
+        { "task_name": "Send selection to Claude Code" }
+      ]
+    }
+  }
+]

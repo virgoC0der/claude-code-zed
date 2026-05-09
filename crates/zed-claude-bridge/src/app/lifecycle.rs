@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::app::cli::{
-    Cli, Command, DaemonArgs, IpcSendAtMentionArgs, IpcSendWorkspaceFoldersArgs,
+    Cli, Command, DaemonArgs, IpcSendAtMentionArgs, IpcSendWorkspaceFoldersArgs, resolve_line_range,
 };
 use crate::ipc;
 use crate::ipc::server::IpcServer;
@@ -158,10 +158,12 @@ async fn run_ipc_send_at_mention(args: IpcSendAtMentionArgs) -> anyhow::Result<(
         .ipc_socket
         .clone()
         .unwrap_or_else(|| ipc::socket_path(&args.workspace));
+    let (line_start, line_end) =
+        resolve_line_range(&args).map_err(|msg| anyhow::anyhow!("{msg}"))?;
     let frame = IpcFrame::AtMention {
         file_path: args.file_path,
-        line_start: args.line_start,
-        line_end: args.line_end,
+        line_start,
+        line_end,
     };
     send_one_frame(&socket_path, &frame).await
 }

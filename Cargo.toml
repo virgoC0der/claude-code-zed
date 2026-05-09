@@ -3,11 +3,6 @@ resolver = "2"
 members = [
     "crates/zed-claude-bridge",
 ]
-# extension/zed-claude-code is a separate wasm32-wasip1 build target, not part of the host workspace
-# (it would otherwise force the whole workspace to resolve features for wasm).
-exclude = [
-    "extension/zed-claude-code",
-]
 
 [workspace.package]
 version = "0.1.0"

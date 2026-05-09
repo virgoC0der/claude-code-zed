@@ -75,6 +75,22 @@ pub struct DaemonArgs {
 }
 
 /// Arguments for `ipc-send-at-mention`.
+///
+/// Three ways to specify the line range, in priority order:
+///
+/// 1. **Explicit:** `--line-start N --line-end M` (0-indexed, inclusive).
+///    Both required together; takes precedence over everything else.
+/// 2. **Text-derived:** `--text "<selection>"` plus `--file-path`. The
+///    sidecar reads the file, finds the first occurrence of `<selection>`,
+///    and computes a 0-indexed line range covering it. Useful when the
+///    caller (e.g. a Zed task) only has access to `$ZED_SELECTED_TEXT`.
+/// 3. **Cursor fallback:** `--cursor-row N` (**1-indexed**, matching Zed's
+///    `$ZED_ROW`). Used when no selection text is available, or when the
+///    text wasn't found in the file. The single row becomes both
+///    `line_start` and `line_end` (still emitted as 0-indexed on the wire).
+///
+/// At least one of (`--line-start`+`--line-end`), `--text`, or
+/// `--cursor-row` must be supplied; otherwise the CLI exits with an error.
 #[derive(Debug, Args)]
 pub struct IpcSendAtMentionArgs {
     /// Workspace root used to derive the IPC socket path.
@@ -89,13 +105,28 @@ pub struct IpcSendAtMentionArgs {
     #[arg(long, value_name = "PATH")]
     pub file_path: String,
 
-    /// 0-indexed inclusive start line of the selection.
-    #[arg(long)]
-    pub line_start: u32,
+    /// 0-indexed inclusive start line of the selection. When provided,
+    /// `--line-end` is also required and overrides `--text` / `--cursor-row`.
+    #[arg(long, requires = "line_end")]
+    pub line_start: Option<u32>,
 
-    /// 0-indexed inclusive end line of the selection.
-    #[arg(long)]
-    pub line_end: u32,
+    /// 0-indexed inclusive end line of the selection. When provided,
+    /// `--line-start` is also required and overrides `--text` / `--cursor-row`.
+    #[arg(long, requires = "line_start")]
+    pub line_end: Option<u32>,
+
+    /// Selected text (typically `$ZED_SELECTED_TEXT`). The sidecar locates
+    /// its first occurrence in `--file-path` to derive the line range.
+    /// Falls back to `--cursor-row` if the text is missing or the file is
+    /// unreadable.
+    #[arg(long, value_name = "STRING")]
+    pub text: Option<String>,
+
+    /// **1-indexed** caret row (typically `$ZED_ROW`). Used when no other
+    /// range information is available, or as a fallback when `--text`
+    /// can't be located.
+    #[arg(long, value_name = "N")]
+    pub cursor_row: Option<u32>,
 }
 
 /// Arguments for `ipc-send-workspace-folders`.
@@ -120,6 +151,96 @@ impl DaemonArgs {
     pub fn resolved_lock_dir(&self) -> PathBuf {
         expand_tilde(&self.lock_dir)
     }
+}
+
+/// Resolve a 0-indexed inclusive line range from the various ways
+/// `ipc-send-at-mention` accepts one.
+///
+/// Priority:
+/// 1. Explicit `--line-start` + `--line-end` (taken verbatim, must be valid).
+/// 2. `--text`: read `file_path`, find the first occurrence; the start line
+///    is the number of `\n` characters preceding the match (0-indexed); the
+///    end line is `start + (number of \n in the matched text)`.
+/// 3. `--cursor-row` (1-indexed) → both bounds become `cursor_row - 1`.
+///
+/// If `--text` is supplied but the file can't be read or the text isn't
+/// found, falls back to `--cursor-row`. If nothing yields a range, returns
+/// an `Err` with a user-facing message.
+pub fn resolve_line_range(args: &IpcSendAtMentionArgs) -> Result<(u32, u32), String> {
+    // 1. Explicit line range wins.
+    if let (Some(start), Some(end)) = (args.line_start, args.line_end) {
+        if start > end {
+            return Err(format!(
+                "--line-start ({start}) must be <= --line-end ({end})",
+            ));
+        }
+        return Ok((start, end));
+    }
+
+    // 2. Try `--text`.
+    if let Some(text) = args.text.as_deref()
+        && !text.is_empty()
+    {
+        match find_text_line_range(std::path::Path::new(&args.file_path), text) {
+            Ok(Some(range)) => return Ok(range),
+            Ok(None) => {
+                tracing::debug!(
+                    file_path = %args.file_path,
+                    "selection text not found in file; falling back to --cursor-row"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    file_path = %args.file_path,
+                    "could not read file to locate selection text; falling back to --cursor-row"
+                );
+            }
+        }
+    }
+
+    // 3. Fall back to cursor row (1-indexed → 0-indexed).
+    if let Some(row_one) = args.cursor_row {
+        if row_one == 0 {
+            return Err("--cursor-row must be >= 1 (it is 1-indexed)".to_string());
+        }
+        let row_zero = row_one - 1;
+        return Ok((row_zero, row_zero));
+    }
+
+    Err("no line range provided: pass --line-start/--line-end, --text, or --cursor-row".to_string())
+}
+
+/// Find the first byte occurrence of `needle` in the file at `path` and
+/// translate it into a 0-indexed inclusive `(line_start, line_end)` range.
+///
+/// Returns `Ok(None)` when the file is readable but does not contain the
+/// needle. Returns `Err` only on I/O errors (so callers can fall back).
+fn find_text_line_range(
+    path: &std::path::Path,
+    needle: &str,
+) -> std::io::Result<Option<(u32, u32)>> {
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let Some(byte_offset) = contents.find(needle) else {
+        return Ok(None);
+    };
+    // Count `\n` bytes before the match → 0-indexed start line.
+    let start_line = count_newlines(&contents[..byte_offset]);
+    // The match itself may span multiple lines; count `\n` inside the
+    // matched substring to derive the end line.
+    let end_line = start_line + count_newlines(needle);
+    // Saturate at u32::MAX to keep the wire types intact even for absurd
+    // inputs; downstream consumers never expect such values in practice.
+    let start_u32 = u32::try_from(start_line).unwrap_or(u32::MAX);
+    let end_u32 = u32::try_from(end_line).unwrap_or(u32::MAX);
+    Ok(Some((start_u32, end_u32)))
+}
+
+fn count_newlines(s: &str) -> usize {
+    s.bytes().filter(|b| *b == b'\n').count()
 }
 
 /// Expand a leading `~` or `~/...` against `$HOME`. Returns the input
@@ -203,11 +324,79 @@ mod tests {
             Command::IpcSendAtMention(a) => {
                 assert_eq!(a.workspace, PathBuf::from("/p"));
                 assert_eq!(a.file_path, "/p/a.rs");
-                assert_eq!(a.line_start, 9);
-                assert_eq!(a.line_end, 19);
+                assert_eq!(a.line_start, Some(9));
+                assert_eq!(a.line_end, Some(19));
+                assert!(a.text.is_none());
+                assert!(a.cursor_row.is_none());
             }
             other => panic!("wrong subcommand: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ipc_send_at_mention_with_text_and_cursor() {
+        let cli = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/p",
+            "--file-path",
+            "/p/a.rs",
+            "--text",
+            "fn foo() {}",
+            "--cursor-row",
+            "7",
+        ])
+        .expect("parse");
+        match cli.command.expect("subcommand present") {
+            Command::IpcSendAtMention(a) => {
+                assert!(a.line_start.is_none());
+                assert!(a.line_end.is_none());
+                assert_eq!(a.text.as_deref(), Some("fn foo() {}"));
+                assert_eq!(a.cursor_row, Some(7));
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ipc_send_at_mention_with_only_cursor() {
+        let cli = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/p",
+            "--file-path",
+            "/p/a.rs",
+            "--cursor-row",
+            "1",
+        ])
+        .expect("parse");
+        match cli.command.expect("subcommand present") {
+            Command::IpcSendAtMention(a) => {
+                assert!(a.line_start.is_none());
+                assert!(a.line_end.is_none());
+                assert!(a.text.is_none());
+                assert_eq!(a.cursor_row, Some(1));
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_line_start_without_line_end() {
+        // `--line-start` requires `--line-end`. clap should error.
+        let res = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/p",
+            "--file-path",
+            "/p/a.rs",
+            "--line-start",
+            "9",
+        ]);
+        assert!(res.is_err(), "expected error when --line-end is missing");
     }
 
     #[test]
@@ -245,5 +434,156 @@ mod tests {
     fn expand_tilde_passes_through_when_no_tilde() {
         let p = expand_tilde(std::path::Path::new("/abs/path"));
         assert_eq!(p, PathBuf::from("/abs/path"));
+    }
+
+    // ---- resolve_line_range ------------------------------------------------
+
+    fn make_args(
+        file_path: &str,
+        line_start: Option<u32>,
+        line_end: Option<u32>,
+        text: Option<&str>,
+        cursor_row: Option<u32>,
+    ) -> IpcSendAtMentionArgs {
+        IpcSendAtMentionArgs {
+            workspace: PathBuf::from("/tmp/ws"),
+            ipc_socket: None,
+            file_path: file_path.to_string(),
+            line_start,
+            line_end,
+            text: text.map(String::from),
+            cursor_row,
+        }
+    }
+
+    #[test]
+    fn resolver_explicit_lines_take_priority_over_text_and_cursor() {
+        // Even with text + cursor_row supplied, explicit lines win.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn other() {}\nfn foo() {}\n").expect("write");
+
+        let args = make_args(
+            file.to_str().expect("utf8 path"),
+            Some(2),
+            Some(4),
+            Some("fn foo() {}"),
+            Some(99),
+        );
+        let (start, end) = resolve_line_range(&args).expect("resolver should succeed");
+        assert_eq!(start, 2);
+        assert_eq!(end, 4);
+    }
+
+    #[test]
+    fn resolver_explicit_lines_reject_inverted_range() {
+        let args = make_args("/nonexistent", Some(5), Some(3), None, None);
+        let err = resolve_line_range(&args).expect_err("inverted range should error");
+        assert!(err.contains("--line-start"), "got: {err}");
+    }
+
+    #[test]
+    fn resolver_text_found_yields_correct_line_range_single_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.rs");
+        // Text content (0-indexed lines):
+        //   0: line zero
+        //   1: line one with target inside
+        //   2: line two
+        std::fs::write(&file, "line zero\nline one with target inside\nline two\n").expect("write");
+
+        let args = make_args(
+            file.to_str().expect("utf8 path"),
+            None,
+            None,
+            Some("target"),
+            Some(99), // ignored: text was found
+        );
+        let (start, end) = resolve_line_range(&args).expect("text should be found");
+        assert_eq!(start, 1);
+        assert_eq!(end, 1);
+    }
+
+    #[test]
+    fn resolver_text_found_yields_correct_line_range_multi_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "header\nfn foo() {\n    bar();\n}\nfooter\n").expect("write");
+
+        // Match spans 3 newlines → start..start+3.
+        let needle = "fn foo() {\n    bar();\n}";
+        let args = make_args(
+            file.to_str().expect("utf8 path"),
+            None,
+            None,
+            Some(needle),
+            None,
+        );
+        let (start, end) = resolve_line_range(&args).expect("multi-line text should resolve");
+        assert_eq!(start, 1);
+        assert_eq!(end, 3);
+    }
+
+    #[test]
+    fn resolver_text_not_found_falls_back_to_cursor_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "line zero\nline one\n").expect("write");
+
+        let args = make_args(
+            file.to_str().expect("utf8 path"),
+            None,
+            None,
+            Some("absent text"),
+            Some(2), // 1-indexed → 0-indexed 1
+        );
+        let (start, end) = resolve_line_range(&args).expect("should fall back to cursor row");
+        assert_eq!(start, 1);
+        assert_eq!(end, 1);
+    }
+
+    #[test]
+    fn resolver_unreadable_file_falls_back_to_cursor_row() {
+        let args = make_args(
+            "/this/path/definitely/does/not/exist.rs",
+            None,
+            None,
+            Some("any text"),
+            Some(5),
+        );
+        let (start, end) =
+            resolve_line_range(&args).expect("unreadable file → fall back to cursor row");
+        assert_eq!(start, 4); // 5 (1-indexed) → 4 (0-indexed)
+        assert_eq!(end, 4);
+    }
+
+    #[test]
+    fn resolver_cursor_only_translates_one_indexed_to_zero_indexed() {
+        let args = make_args("/whatever", None, None, None, Some(10));
+        let (start, end) = resolve_line_range(&args).expect("cursor row only is enough");
+        assert_eq!(start, 9);
+        assert_eq!(end, 9);
+    }
+
+    #[test]
+    fn resolver_cursor_zero_is_rejected() {
+        let args = make_args("/whatever", None, None, None, Some(0));
+        let err = resolve_line_range(&args).expect_err("cursor 0 invalid");
+        assert!(err.contains("1-indexed"), "got: {err}");
+    }
+
+    #[test]
+    fn resolver_no_inputs_returns_error() {
+        let args = make_args("/whatever", None, None, None, None);
+        let err = resolve_line_range(&args).expect_err("no inputs → error");
+        assert!(err.contains("no line range"), "got: {err}");
+    }
+
+    #[test]
+    fn resolver_empty_text_falls_back_to_cursor() {
+        let args = make_args("/whatever", None, None, Some(""), Some(3));
+        let (start, end) = resolve_line_range(&args).expect("empty text → cursor row");
+        assert_eq!(start, 2);
+        assert_eq!(end, 2);
     }
 }

@@ -5,18 +5,17 @@
 - root: /Users/sx.chen/Code/personal/claude-code-zed
 - primary_language: rust
 - package_manager: cargo
-- secondary: zed extension (Rust → WASM via Zed extension API)
 
 ## Goal
 Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed editor:
 - A sidecar binary runs a local WebSocket MCP server.
 - It writes `~/.claude/ide/<port>.lock` so the Claude Code CLI's `/ide` command can discover Zed.
-- A companion Zed extension exposes a "Send to Claude Code" action (right-click on selection / command palette) that tells the sidecar to emit an `at_mentioned` JSON-RPC notification → the active Claude Code terminal session receives `@path/to/file#L10-20`.
+- A project-local Zed task (`.zed/tasks.json`) bound to a keymap (`cmd-shift-c`) reads `$ZED_FILE` / `$ZED_ROW` / `$ZED_SELECTED_TEXT` and invokes `zed-claude-bridge ipc-send-at-mention`, which causes the sidecar to emit an `at_mentioned` JSON-RPC notification → the active Claude Code terminal session receives `@path/to/file#L10-20`.
 
 ## Architecture (decided 2026-05-09)
-- **Sidecar binary** (Rust): `crates/zed-claude-bridge` — owns the WebSocket server, lock file, and JSON-RPC dispatch. Long-running daemon-style process, one per Zed window/workspace.
-- **Zed extension** (Rust → WASM): `extension/zed-claude-code` — registers slash commands and context-menu actions; communicates with the sidecar over a Unix domain socket at `$TMPDIR/zed-claude-bridge-<workspace-hash>.sock` using a tiny line-delimited JSON protocol.
-- **Workspace**: Cargo workspace with members `crates/zed-claude-bridge` and `extension/zed-claude-code`.
+- **Sidecar binary** (Rust): `crates/zed-claude-bridge` — owns the WebSocket server, lock file, JSON-RPC dispatch, and an `ipc-send-at-mention` helper subcommand. Long-running daemon-style process, one per Zed window/workspace.
+- **Editor integration**: not a Zed extension. We use Zed's built-in task system (`.zed/tasks.json` + `.zed/keymap.json`). The original WASM extension scaffold was deleted in the Tasks #11–#13 pivot (2026-05-09) because Zed's extension API does not expose editor selections or context menus.
+- **Workspace**: single-crate Cargo workspace with member `crates/zed-claude-bridge`.
 
 ## Commands
 > Use these EXACT commands. Agents must not invent equivalents.
@@ -35,15 +34,16 @@ Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed edi
 
 ## Source Layout
 - source_dirs:
-  - `crates/zed-claude-bridge/src/`  (sidecar binary)
-  - `extension/zed-claude-code/src/` (Zed extension WASM)
+  - `crates/zed-claude-bridge/src/`  (sidecar binary; the only crate)
 - test_dirs:
   - `crates/zed-claude-bridge/tests/` (integration tests)
   - inline `#[cfg(test)] mod tests` for unit tests
 - entrypoints:
   - `crates/zed-claude-bridge/src/main.rs`     (binary)
-  - `extension/zed-claude-code/src/lib.rs`     (Zed extension)
-  - `extension/zed-claude-code/extension.toml` (Zed extension manifest)
+- editor_config:
+  - `.zed/tasks.json`  — Zed task `Send selection to Claude Code`
+  - `.zed/keymap.json` — `cmd-shift-c` → `task::Spawn`
+- removed: the original Zed WASM extension at `extension/zed-claude-code/` was deleted in the keymap-flow pivot (Tasks #11–#13). Selection capture is now driven entirely by Zed's built-in task system.
 
 ## Architectural Rules
 - layer_order:
@@ -51,7 +51,7 @@ Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed edi
   2. `lockfile/` — read/write `~/.claude/ide/<port>.lock` (depends on protocol)
   3. `mcp/` — MCP server logic: tools/list, tools/call dispatch (depends on protocol)
   4. `transport/` — WebSocket accept loop + auth header check (depends on mcp, protocol)
-  5. `ipc/` — Unix-socket IPC server consumed by the Zed extension (depends on transport)
+  5. `ipc/` — Unix-socket IPC server consumed by helper subcommands and the Zed task (depends on transport)
   6. `app/` — wiring: CLI args, lifecycle, signal handling (depends on all)
   7. `main.rs` — entrypoint only, no logic
 - placement_rules:
@@ -67,7 +67,7 @@ Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed edi
 
 ## Conventions
 - Edition: 2024 (Rust 1.91+).
-- MSRV: 1.85 (Zed extension API target).
+- MSRV: 1.85.
 - All public items have rustdoc; private items only when non-obvious.
 - File naming: `snake_case.rs`. Module per concern, not per type.
 - Tests: prefer integration tests under `tests/` for protocol round-trips; unit tests inline for pure logic.
@@ -76,7 +76,7 @@ Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed edi
 1. Reverse-engineered protocol notes in `docs/protocol.md` (to be created — captures lock-file shape, JSON-RPC methods, MCP tool list extracted from VSCode extension v2.1.76).
 2. Reference implementation: `~/.vscode/extensions/anthropic.claude-code-2.1.76-darwin-arm64/extension.js` (read-only ground truth).
 3. Existing community plugins: `coder/claudecode.nvim`, `greggh/claude-code.nvim` (web search if needed for edge cases).
-4. Zed extension API: https://zed.dev/docs/extensions, `~/Library/Application Support/Zed/extensions/`.
+4. Zed task system: https://zed.dev/docs/tasks (see also `~/Library/Application Support/Zed/external_agents/` for the ACP integration we explicitly do not use here).
 5. MCP spec: https://modelcontextprotocol.io/.
 6. Codebase grep / tests.
 

@@ -1,11 +1,11 @@
 # claude-code-zed
 
-A local sidecar binary plus a Zed extension that bring Claude Code's
-`/ide` integration to [Zed](https://zed.dev). When the sidecar is running
-for your Zed window, the Claude Code CLI's `/ide` command will discover Zed
-the same way it discovers VS Code or JetBrains, and the **Send to Claude
-Code** slash command in Zed delivers `@<file>#L<a>-<b>` style at-mentions
-to the active Claude Code prompt.
+A local sidecar binary plus a project-local Zed task that bring Claude
+Code's `/ide` integration to [Zed](https://zed.dev). When the sidecar is
+running for your Zed window, the Claude Code CLI's `/ide` command will
+discover Zed the same way it discovers VS Code or JetBrains, and a
+`cmd-alt-shift-c` keybinding delivers `@<file>#L<m>-<n>` style at-mentions
+from the editor selection straight into the active Claude Code prompt.
 
 The on-the-wire protocol is reverse-engineered from Anthropic's official
 VSCode extension (v2.1.76) and documented byte-for-byte in
@@ -17,17 +17,31 @@ implementation is at
 
 - **Sidecar binary** (`zed-claude-bridge`): functional. WebSocket MCP
   server, lock-file discovery, IPC socket, signal-handled lifecycle,
-  selection debounce + dedup.
-- **Zed extension** (`zed-claude-code`): registers a `/send-to-claude`
-  slash command; right-click context-menu entry is *not* wired (Zed's
-  current `zed_extension_api` 0.7 has no editor-action hook).
+  selection debounce + dedup, and an `ipc-send-at-mention` helper that
+  derives the line range from `$ZED_SELECTED_TEXT` (or falls back to
+  `$ZED_ROW`).
+- **At-mention trigger**: a project-local Zed *task* (`.zed/tasks.json`)
+  bound to `cmd-alt-shift-c` (`.zed/keymap.json`). The task receives
+  `$ZED_FILE`, `$ZED_ROW`, `$ZED_SELECTED_TEXT`, and
+  `$ZED_WORKTREE_ROOT` from Zed and forwards them to the sidecar over
+  IPC.
+- **No Zed extension.** Zed's `zed_extension_api` (≤ 0.7) exposes
+  neither the editor's primary selection nor a context-menu hook to
+  extensions, so an extension cannot implement a "Send selection to
+  Claude Code" command on its own. Selection capture is delegated to
+  Zed's built-in task system instead. An earlier iteration of this
+  repo shipped a `zed-claude-code` extension as a slash-command
+  scaffold; it has been removed. The deferred spec stub at
+  `openspec/changes/zed-claude-bridge/specs/zed-extension/spec.md`
+  remains as a reference for any future Zed API change that would let
+  us revisit the extension-driven flow.
 
 ## Repository layout
 
 ```
 claude-code-zed/
 ├── crates/zed-claude-bridge/        Sidecar binary (Rust, host target)
-├── extension/zed-claude-code/       Zed extension (Rust → wasm32-wasip1)
+├── .zed/                            Project-local Zed task + keymap
 ├── docs/protocol.md                 Wire-format spec (source of truth)
 ├── openspec/changes/                Active OpenSpec change(s)
 ├── scripts/smoke.sh                 Manual end-to-end smoke harness
@@ -49,14 +63,9 @@ cargo build --workspace                  # debug
 cargo build --workspace --release        # optimized
 ```
 
-The Zed extension is excluded from the host workspace because it targets
-`wasm32-wasip1`; build it separately:
-
-```bash
-rustup target add wasm32-wasip1
-cd extension/zed-claude-code
-cargo build --target wasm32-wasip1 --release
-```
+There is only one host crate (`crates/zed-claude-bridge`); the workspace
+no longer ships a WASM Zed extension. See the *Status* section above for
+why.
 
 ## Run the sidecar
 
@@ -92,13 +101,30 @@ CLI flags:
 | `--ipc-socket` | derived            | Override the IPC socket path                         |
 | `--lock-dir`   | `~/.claude/ide`    | Override the lock-file directory                     |
 
-Helper subcommands used by the Zed extension (you usually don't run these
-by hand):
+Helper subcommands used by the Zed task (you usually don't run these by
+hand):
 
 ```bash
-zed-claude-bridge ipc-send-at-mention      --workspace <ROOT> --file-path <P> --line-start <L0> --line-end <L1>
-zed-claude-bridge ipc-send-workspace-folders --workspace <ROOT> --folder <P> [--folder <P> ...]
+# Forward an at-mention. Three ways to specify the line range, in
+# priority order:
+#   1. explicit:  --line-start <L0> --line-end <L1>          (0-indexed)
+#   2. from text: --text <STRING>  (located inside --file-path)
+#   3. cursor:    --cursor-row <N>                           (1-indexed)
+zed-claude-bridge ipc-send-at-mention \
+    --workspace <ROOT> --file-path <P> \
+    [--text <STRING>] [--cursor-row <N>] \
+    [--line-start <L0> --line-end <L1>]
+
+zed-claude-bridge ipc-send-workspace-folders \
+    --workspace <ROOT> --folder <P> [--folder <P> ...]
 ```
+
+Resolution: explicit `--line-start`/`--line-end` win; otherwise `--text`
+is located in the file and the matching line range is computed
+(0-indexed, multi-line aware); if the text isn't found or the file
+isn't readable, the helper falls back to `--cursor-row` (1-indexed,
+matching Zed's `$ZED_ROW`); if no usable input is provided the helper
+exits non-zero.
 
 ## Use `/ide` from Claude Code
 
@@ -111,23 +137,56 @@ zed-claude-bridge ipc-send-workspace-folders --workspace <ROOT> --folder <P> [--
    `getCurrentSelection`, `getLatestSelection`, `getOpenEditors`,
    `getWorkspaceFolders`.
 
-## Install the Zed extension (dev mode)
+## Usage: send a selection from Zed to Claude Code
 
-1. Build the wasm artifact (see above).
-2. In Zed: open the command palette → `zed: install dev extension` → pick
-   the `extension/zed-claude-code/` directory.
-3. The slash command `/send-to-claude` will appear in the assistant panel.
-   Usage:
+The full end-to-end flow uses Zed's built-in *task* system (no extension
+required for at-mentions):
 
+1. **Install the binary so Zed can find it on `PATH`.**
+
+   ```bash
+   cargo install --path crates/zed-claude-bridge
+   # or, after `cargo build --workspace --release`, copy the binary:
+   #   cp target/release/zed-claude-bridge ~/.local/bin/
    ```
-   /send-to-claude <file> <start-line> <end-line>
+
+2. **Start the sidecar for your project workspace.**
+
+   ```bash
+   cd /path/to/your/project
+   zed-claude-bridge --workspace "$(pwd)"
    ```
 
-   `<file>` may be relative to the worktree root or absolute. Lines are
-   **0-indexed** (matching the underlying IPC frame format). The
-   extension forwards the request to the sidecar via a helper-binary
-   invocation; if the sidecar isn't running it'll spawn one and retry up
-   to 5 times with exponential backoff.
+3. **Copy this repo's `.zed/tasks.json` and `.zed/keymap.json` into your
+   project root.** If you already have one of those files, merge: append
+   the `Send selection to Claude Code` entry to your `tasks.json` array
+   and add the `cmd-alt-shift-c` binding to your `keymap.json` array.
+
+   ```bash
+   mkdir -p .zed
+   cp /path/to/claude-code-zed/.zed/tasks.json   .zed/
+   cp /path/to/claude-code-zed/.zed/keymap.json  .zed/
+   ```
+
+4. **In Zed**, open any file in this project, select some text, and press
+   `cmd-alt-shift-c`. The task spawns silently (no terminal pop-up because
+   `reveal: "never"`) and the sidecar forwards an `at_mention` IPC frame
+   over the local socket.
+
+5. **In your `claude /ide` terminal session**, the prompt receives
+   `@<path>#L<m>-<n>` — exactly as VSCode's "Send to Claude Code" would.
+
+If no text is selected, the task still fires and the at-mention falls
+back to a single-line range at the caret row (`$ZED_ROW`).
+
+### Why a task, not a slash command or context-menu action?
+
+Zed's extension API (`zed_extension_api` 0.7) does not currently expose
+the editor's selection or a context-menu hook to extensions. The task
+system, on the other hand, hands `$ZED_FILE`, `$ZED_ROW`,
+`$ZED_SELECTED_TEXT`, and `$ZED_WORKTREE_ROOT` to whatever shell
+command the task spawns — exactly what we need. Once Zed's extension
+API grows a selection accessor we can revisit.
 
 ## Tests and verification
 
@@ -146,18 +205,19 @@ For a hands-on end-to-end check (requires `jq` and `websocat`):
 bash scripts/smoke.sh
 ```
 
-Test inventory (host workspace only):
+Test inventory (**109 tests** total at last count, all in the host
+workspace):
 
-- 72 unit tests across `protocol`, `lockfile`, `mcp`, `transport`, `ipc`,
-  `app::cli`.
+- 85 unit tests across `protocol`, `lockfile`, `mcp`, `transport`, `ipc`,
+  `app::cli` (the latter cover the `--text` / `--cursor-row` /
+  `--line-start`/`--line-end` resolution priority for
+  `ipc-send-at-mention`).
 - 7 WebSocket integration tests in `tests/handshake.rs`.
 - 14 IPC integration tests in `tests/ipc.rs`.
-- 1 full-stack end-to-end test in `tests/end_to_end.rs` (extension → IPC
-  → sidecar → WebSocket → MCP client, with at_mention 0 → 1-indexed
-  conversion verified on the wire).
+- 1 full-stack end-to-end test in `tests/end_to_end.rs` (IPC → sidecar →
+  WebSocket → MCP client, with at_mention 0 → 1-indexed conversion
+  verified on the wire).
 - 2 lock-file integration tests in `tests/lockfile.rs`.
-- 8 unit tests inside the Zed extension crate (run from inside
-  `extension/zed-claude-code/`).
 
 ## Specs
 

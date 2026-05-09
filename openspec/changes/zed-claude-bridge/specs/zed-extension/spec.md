@@ -1,5 +1,16 @@
 # Spec Delta: zed-extension
 
+> **Note:** This capability has been superseded by the `.zed/tasks.json` flow
+> described in the proposal. Zed's `zed_extension_api` (≤ 0.7) does not expose
+> the editor's primary selection or a context-menu hook to extensions, so the
+> requirements below are deferred indefinitely. The `extension/zed-claude-code/`
+> crate that originally held this scaffold has been removed; selection capture
+> now goes through Zed's built-in task system, which hands `$ZED_FILE`,
+> `$ZED_ROW`, `$ZED_SELECTED_TEXT`, and `$ZED_WORKTREE_ROOT` to the
+> `zed-claude-bridge ipc-send-at-mention` helper. The text below is preserved
+> for spec-validate compatibility and as a reference for any future Zed API
+> change that would let us revive an extension-driven flow.
+
 ## ADDED Requirements
 
 ### Requirement: Extension manifest
