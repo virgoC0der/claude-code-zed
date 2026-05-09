@@ -4,7 +4,7 @@ A local sidecar binary plus a project-local Zed task that bring Claude
 Code's `/ide` integration to [Zed](https://zed.dev). When the sidecar is
 running for your Zed window, the Claude Code CLI's `/ide` command will
 discover Zed the same way it discovers VS Code or JetBrains, and a
-`cmd-alt-shift-c` keybinding delivers `@<file>#L<m>-<n>` style at-mentions
+`cmd-ctrl-c` keybinding delivers `@<file>#L<m>-<n>` style at-mentions
 from the editor selection straight into the active Claude Code prompt.
 
 The on-the-wire protocol is reverse-engineered from Anthropic's official
@@ -21,7 +21,7 @@ implementation is at
   derives the line range from `$ZED_SELECTED_TEXT` (or falls back to
   `$ZED_ROW`).
 - **At-mention trigger**: a project-local Zed *task* (`.zed/tasks.json`)
-  bound to `cmd-alt-shift-c` (`.zed/keymap.json`). The task receives
+  bound to `cmd-ctrl-c` (`.zed/keymap.json`). The task receives
   `$ZED_FILE`, `$ZED_ROW`, `$ZED_SELECTED_TEXT`, and
   `$ZED_WORKTREE_ROOT` from Zed and forwards them to the sidecar over
   IPC.
@@ -160,7 +160,7 @@ required for at-mentions):
 3. **Copy this repo's `.zed/tasks.json` and `.zed/keymap.json` into your
    project root.** If you already have one of those files, merge: append
    the `Send selection to Claude Code` entry to your `tasks.json` array
-   and add the `cmd-alt-shift-c` binding to your `keymap.json` array.
+   and add the `cmd-ctrl-c` binding to your `keymap.json` array.
 
    ```bash
    mkdir -p .zed
@@ -169,7 +169,7 @@ required for at-mentions):
    ```
 
 4. **In Zed**, open any file in this project, select some text, and press
-   `cmd-alt-shift-c`. The task spawns silently (no terminal pop-up because
+   `cmd-ctrl-c`. The task spawns silently (no terminal pop-up because
    `reveal: "never"`) and the sidecar forwards an `at_mention` IPC frame
    over the local socket.
 

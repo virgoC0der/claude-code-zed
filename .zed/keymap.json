@@ -2,7 +2,7 @@
   {
     "context": "Editor",
     "bindings": {
-      "cmd-alt-shift-c": [
+      "cmd-ctrl-c": [
         "task::Spawn",
         { "task_name": "Send selection to Claude Code" }
       ]
