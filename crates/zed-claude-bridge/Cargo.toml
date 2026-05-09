@@ -1,0 +1,43 @@
+[package]
+name = "zed-claude-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local sidecar that bridges Zed to Claude Code's /ide command via a WebSocket MCP server."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zed-claude-bridge"
+path = "src/main.rs"
+
+[lib]
+name = "zed_claude_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+# xxhash-rust: required by `specs/ipc/spec.md` to compute the workspace-hash
+# component of `$TMPDIR/zed-claude-bridge-<xxh3-hex>.sock` so the Zed extension
+# and the sidecar agree on the IPC socket path. xxh3_64 is non-cryptographic;
+# any other algorithm would break compatibility.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs", "process"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+http = "1"

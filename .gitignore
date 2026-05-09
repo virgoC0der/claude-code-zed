@@ -1,0 +1,8 @@
+# Cargo build artifacts (root + nested crates like extension/).
+target/
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+.harness/verifier-scripts/
+# Local Claude Code agent state (private to the developer).
+.claude/
