@@ -69,12 +69,33 @@ why.
 
 ## Run the sidecar
 
-The sidecar is one process per Zed window/workspace. Start it pointing at
-your project root:
+You have two options:
+
+### Option A: launch on macOS login (recommended)
+
+Install the bundled LaunchAgent. It runs a single sidecar pinned to your
+home directory (`--workspace "$HOME"`), which Claude Code's `/ide` will
+match against any project under `~/`:
+
+```bash
+cargo install --path crates/zed-claude-bridge      # ensure binary on PATH
+chmod 700 ~/.claude/ide                            # one-time, sidecar requires 0700
+./scripts/install-launchd.sh                       # install + start the agent
+```
+
+Logs at `~/Library/Logs/zed-claude-bridge.log`. Uninstall with
+`./scripts/uninstall-launchd.sh`.
+
+### Option B: run by hand
+
+Per-window manual launch, useful when you want one sidecar per project:
 
 ```bash
 cargo run -p zed-claude-bridge -- --workspace /path/to/your/project
 ```
+
+If you go this route, edit `.zed/tasks.json` so `--workspace` is
+`$ZED_WORKTREE_ROOT` (the original behaviour) instead of `$HOME`.
 
 What happens at startup:
 

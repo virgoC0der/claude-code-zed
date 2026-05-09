@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.virgoC0der.zed-claude-bridge</string>
+
+    <!--
+      Single sidecar pinned to $HOME. Claude Code's `/ide` discovery
+      matches the running CLI's cwd against `workspaceFolders` (prefix
+      match), so a sidecar whose workspace is your home directory
+      satisfies any project under it. This is the simplest working
+      setup for a single-user machine; if you frequently work outside
+      ~/, change `--workspace` below or run multiple LaunchAgents on
+      different Labels.
+    -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+        <string>--workspace</string>
+        <string>__HOME__</string>
+        <string>--foreground</string>
+        <string>--log-level</string>
+        <string>info</string>
+    </array>
+
+    <!-- Run on user login and keep alive across crashes. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restart loop if the binary keeps exiting fast. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logs to a stable path so `tail -f ~/Library/Logs/zed-claude-bridge.log` works. -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/zed-claude-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/zed-claude-bridge.log</string>
+
+    <!--
+      Inherit a sane PATH so the binary can find `git`, `claude`, etc.
+      launchd's default PATH excludes ~/.local/bin and Homebrew paths.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Make sure tmpdir is the user's, not /var/folders/.../launchd-... -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

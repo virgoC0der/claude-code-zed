@@ -149,7 +149,13 @@ async fn send_one_frame(socket_path: &std::path::Path, frame: &IpcFrame) -> anyh
         .write_all(&bytes)
         .await
         .context("writing IPC frame")?;
+    stream.flush().await.context("flushing IPC frame")?;
     stream.shutdown().await.ok();
+    // Give the kernel a moment to deliver the bytes before the process exits.
+    // Without this delay, in-flight Unix-socket writes can be discarded when
+    // the connection's last reference drops (observed on macOS launchd-spawned
+    // and shell-spawned binaries alike).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(())
 }
 

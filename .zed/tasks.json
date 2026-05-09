@@ -1,9 +1,8 @@
 [
   {
     "label": "Send selection to Claude Code",
-    "command": "zed-claude-bridge ipc-send-at-mention --workspace \"$WS\" --file-path \"$FP\" --cursor-row \"$ROW\" --text \"$TEXT\"",
+    "command": "zed-claude-bridge ipc-send-at-mention --workspace \"$HOME\" --file-path \"$FP\" --cursor-row \"$ROW\" --text \"$TEXT\"",
     "env": {
-      "WS": "$ZED_WORKTREE_ROOT",
       "FP": "$ZED_FILE",
       "ROW": "$ZED_ROW",
       "TEXT": "$ZED_SELECTED_TEXT"
