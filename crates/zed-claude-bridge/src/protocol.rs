@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 envelope
@@ -418,6 +419,19 @@ pub enum IpcFrame {
     /// editors report selection rows). The sidecar adds `+1` before forwarding
     /// the values into the [`AtMentionedParams`] notification, which is
     /// **1-indexed** per the Claude Code wire format.
+    ///
+    /// Two optional fields drive the session-routing rules documented in
+    /// the `notifications` capability spec:
+    /// - `workspace_root`: the Zed worktree root from which the at-mention
+    ///   was triggered (populated by the Zed task from `$ZED_WORKTREE_ROOT`).
+    ///   The sidecar matches it against each registered WebSocket client's
+    ///   workspace to pick a recipient.
+    /// - `client_id`: the registry id of a specific WebSocket client to
+    ///   route directly to. Populated only on the second leg of a picker
+    ///   round-trip (see `ipc-send-at-mention` picker round-trip behaviour
+    ///   in the `protocol` capability spec).
+    ///
+    /// Both fields are omitted entirely on the wire when `None`.
     AtMention {
         /// Path of the file the at-mention refers to.
         file_path: String,
@@ -425,6 +439,12 @@ pub enum IpcFrame {
         line_start: u32,
         /// 0-indexed inclusive end line.
         line_end: u32,
+        /// Optional Zed worktree root for workspace-based routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<PathBuf>,
+        /// Optional direct-route override; bypasses workspace matching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<Uuid>,
     },
     /// Workspace roots changed; sidecar should rewrite the lock file.
     WorkspaceFolders {
@@ -448,6 +468,55 @@ pub enum IpcFrame {
         /// Human-readable message.
         message: String,
     },
+    /// Sidecar's reply to an at-mention whose workspace match was
+    /// non-unique. Carries the candidate WebSocket clients so the helper
+    /// can present a picker (macOS `osascript choose from list`) and
+    /// then write a follow-up `AtMention` frame on the same IPC
+    /// connection with a `client_id` set.
+    ///
+    /// This variant is emitted **only by the sidecar**. Helpers SHALL NOT
+    /// send it. See the `notifications` capability spec for routing
+    /// semantics and the `protocol` capability spec for the
+    /// `AmbiguousCandidate` shape.
+    Ambiguous {
+        /// One candidate per WebSocket client whose workspace matched.
+        /// Order is stable for the lifetime of one picker round-trip
+        /// (sidecar-side iteration order at the moment of routing).
+        candidates: Vec<AmbiguousCandidate>,
+    },
+}
+
+/// One candidate inside an [`IpcFrame::Ambiguous`] reply.
+///
+/// The sidecar builds these from its `ClientRegistry` snapshot at the
+/// moment it decides routing is ambiguous. The four fields are exactly
+/// what the helper needs to render a picker label and to write a
+/// follow-up `AtMention` frame with the chosen client.
+///
+/// Wire field set (no extras, no missing): `client_id`, `label`,
+/// `connected_at_ms_ago`, `last_activity_ms_ago`. See the `protocol`
+/// capability spec, **AmbiguousCandidate shape** requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousCandidate {
+    /// Registry id of the candidate WebSocket client. Serializes as
+    /// the lowercase 36-character hyphenated UUID v4 form (via the
+    /// `uuid` crate's `serde` feature). Used as the value of
+    /// `--client-id` on the helper's follow-up frame.
+    pub client_id: Uuid,
+    /// Human-readable description shown to the user in the picker.
+    /// Constructed sidecar-side from the registry entry's metadata
+    /// (e.g. `"Session 2 — connected 30s ago (last active 3s ago)"`).
+    /// Guaranteed distinct within one `candidates` list.
+    pub label: String,
+    /// Milliseconds since the client's WebSocket upgrade completed.
+    /// Used by the helper on platforms without a native picker (Linux
+    /// today) and as picker label context. Non-negative by type —
+    /// JSON values like `-1` fail to parse with a typed error.
+    pub connected_at_ms_ago: u64,
+    /// Milliseconds since the client last sent a JSON-RPC frame. Used
+    /// as the Linux fallback's "most-recently-active" key (smallest
+    /// value wins). Non-negative by type.
+    pub last_activity_ms_ago: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +790,7 @@ mod tests {
 
     #[test]
     fn ipc_at_mention_frame_roundtrip() {
+        // Legacy fields only — both optional fields absent on the wire.
         let fixture = r#"{"type":"at_mention","file_path":"/x","line_start":1,"line_end":3}"#;
         let f: IpcFrame = serde_json::from_str(fixture).expect("parses");
         match &f {
@@ -728,15 +798,203 @@ mod tests {
                 file_path,
                 line_start,
                 line_end,
+                workspace_root,
+                client_id,
             } => {
                 assert_eq!(file_path, "/x");
                 assert_eq!(*line_start, 1);
                 assert_eq!(*line_end, 3);
+                assert!(workspace_root.is_none());
+                assert!(client_id.is_none());
             }
             _ => panic!("wrong variant"),
         }
         let back = serde_json::to_string(&f).expect("serializes");
         assert_eq!(canonical(fixture), canonical(&back));
+
+        // Defence-in-depth: the serialized form MUST omit workspace_root
+        // and client_id when both are None.
+        let v: Value = serde_json::from_str(&back).expect("parse back");
+        let obj = v.as_object().expect("object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["type", "file_path", "line_start", "line_end"]
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(keys, expected, "legacy frame has unexpected keys: {keys:?}");
+    }
+
+    #[test]
+    fn ipc_at_mention_frame_with_workspace_root_only_roundtrip() {
+        let fixture = r#"{"type":"at_mention","file_path":"/p/x.rs","line_start":3,"line_end":4,"workspace_root":"/p"}"#;
+        let f: IpcFrame = serde_json::from_str(fixture).expect("parses");
+        match &f {
+            IpcFrame::AtMention {
+                file_path,
+                line_start,
+                line_end,
+                workspace_root,
+                client_id,
+            } => {
+                assert_eq!(file_path, "/p/x.rs");
+                assert_eq!(*line_start, 3);
+                assert_eq!(*line_end, 4);
+                assert_eq!(workspace_root.as_deref(), Some(std::path::Path::new("/p")));
+                assert!(client_id.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        let back = serde_json::to_string(&f).expect("serializes");
+        assert_eq!(canonical(fixture), canonical(&back));
+
+        // The serialized form MUST contain workspace_root and MUST NOT
+        // contain client_id.
+        let v: Value = serde_json::from_str(&back).expect("parse back");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("workspace_root"));
+        assert!(!obj.contains_key("client_id"));
+    }
+
+    #[test]
+    fn ipc_at_mention_frame_with_client_id_only_roundtrip() {
+        // The wire form is the lowercase hyphenated UUID v4 (uuid crate's
+        // serde feature default).
+        let fixture = r#"{"type":"at_mention","file_path":"/p/x.rs","line_start":0,"line_end":0,"client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479"}"#;
+        let f: IpcFrame = serde_json::from_str(fixture).expect("parses");
+        match &f {
+            IpcFrame::AtMention {
+                file_path,
+                line_start,
+                line_end,
+                workspace_root,
+                client_id,
+            } => {
+                assert_eq!(file_path, "/p/x.rs");
+                assert_eq!(*line_start, 0);
+                assert_eq!(*line_end, 0);
+                assert!(workspace_root.is_none());
+                assert_eq!(
+                    *client_id,
+                    Some(Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("uuid"))
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+        let back = serde_json::to_string(&f).expect("serializes");
+        assert_eq!(canonical(fixture), canonical(&back));
+
+        let v: Value = serde_json::from_str(&back).expect("parse back");
+        let obj = v.as_object().expect("object");
+        assert!(!obj.contains_key("workspace_root"));
+        assert_eq!(
+            obj.get("client_id").and_then(|v| v.as_str()),
+            Some("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+        );
+    }
+
+    #[test]
+    fn ipc_at_mention_frame_with_both_optional_fields_roundtrip() {
+        let fixture = r#"{"type":"at_mention","file_path":"/p/x.rs","line_start":1,"line_end":2,"workspace_root":"/p","client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479"}"#;
+        let f: IpcFrame = serde_json::from_str(fixture).expect("parses");
+        match &f {
+            IpcFrame::AtMention {
+                workspace_root,
+                client_id,
+                ..
+            } => {
+                assert_eq!(workspace_root.as_deref(), Some(std::path::Path::new("/p")));
+                assert_eq!(
+                    *client_id,
+                    Some(Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("uuid"))
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+        let back = serde_json::to_string(&f).expect("serializes");
+        assert_eq!(canonical(fixture), canonical(&back));
+    }
+
+    #[test]
+    fn ipc_ambiguous_frame_one_candidate_roundtrip() {
+        let fixture = r#"{"type":"ambiguous","candidates":[{"client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","label":"Session 1 — connected 2m ago","connected_at_ms_ago":120000,"last_activity_ms_ago":3000}]}"#;
+        let f: IpcFrame = serde_json::from_str(fixture).expect("parses");
+        match &f {
+            IpcFrame::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 1);
+                let c = &candidates[0];
+                assert_eq!(
+                    c.client_id,
+                    Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("uuid")
+                );
+                assert_eq!(c.label, "Session 1 — connected 2m ago");
+                assert_eq!(c.connected_at_ms_ago, 120000);
+                assert_eq!(c.last_activity_ms_ago, 3000);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let back = serde_json::to_string(&f).expect("serializes");
+        assert_eq!(canonical(fixture), canonical(&back));
+    }
+
+    #[test]
+    fn ipc_ambiguous_frame_two_candidates_roundtrip() {
+        let fixture = r#"{"type":"ambiguous","candidates":[
+            {"client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","label":"Session 1","connected_at_ms_ago":1000,"last_activity_ms_ago":100},
+            {"client_id":"00000000-0000-4000-8000-000000000000","label":"Session 2","connected_at_ms_ago":2000,"last_activity_ms_ago":50}
+        ]}"#;
+        let f: IpcFrame = serde_json::from_str(fixture).expect("parses");
+        match &f {
+            IpcFrame::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].label, "Session 1");
+                assert_eq!(candidates[1].label, "Session 2");
+                assert!(candidates[1].last_activity_ms_ago < candidates[0].last_activity_ms_ago);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let back = serde_json::to_string(&f).expect("serializes");
+        assert_eq!(canonical(fixture), canonical(&back));
+    }
+
+    #[test]
+    fn ambiguous_candidate_has_exactly_four_keys() {
+        let fixture = r#"{"client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","label":"Session 1","connected_at_ms_ago":3000,"last_activity_ms_ago":1000}"#;
+        let c: AmbiguousCandidate = serde_json::from_str(fixture).expect("parses");
+        let back = serde_json::to_string(&c).expect("serializes");
+        assert_eq!(canonical(fixture), canonical(&back));
+
+        let v: Value = serde_json::from_str(&back).expect("parse back");
+        let obj = v.as_object().expect("object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "client_id",
+            "label",
+            "connected_at_ms_ago",
+            "last_activity_ms_ago",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn ambiguous_candidate_rejects_negative_durations() {
+        // u64 rejects negative integers at parse time — typed error, no panic.
+        let bad = r#"{"client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","label":"x","connected_at_ms_ago":-1,"last_activity_ms_ago":0}"#;
+        let err = serde_json::from_str::<AmbiguousCandidate>(bad)
+            .expect_err("negative connected_at_ms_ago must reject");
+        // Defence-in-depth: error references the offending field name.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("connected_at_ms_ago") || msg.contains("invalid"),
+            "error message should reference the field or an 'invalid' indicator, got: {msg}"
+        );
+
+        // Symmetric: also rejects negative last_activity_ms_ago.
+        let bad2 = r#"{"client_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","label":"x","connected_at_ms_ago":0,"last_activity_ms_ago":-2}"#;
+        assert!(serde_json::from_str::<AmbiguousCandidate>(bad2).is_err());
     }
 
     #[test]

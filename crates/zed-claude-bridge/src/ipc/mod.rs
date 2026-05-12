@@ -1,7 +1,9 @@
 //! Unix-domain-socket IPC server consumed by the Zed extension.
 //!
 //! Layer position: this is layer 5 — depends on `protocol`, `mcp`, and
-//! `transport` (specifically `transport::Transport::notifier`).
+//! `transport` (specifically [`crate::transport::ClientRegistry`] for
+//! per-client outbound delivery and the [`crate::transport::router`]
+//! module for at-mention / selection-changed routing decisions).
 //!
 //! The Zed extension cannot host a TCP server in WASM, so the sidecar
 //! exposes a per-workspace Unix socket. The socket path is derived from the

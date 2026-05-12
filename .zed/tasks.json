@@ -1,14 +1,16 @@
 [
   {
     "label": "Send selection to Claude Code",
-    "command": "zed-claude-bridge ipc-send-at-mention --workspace \"$HOME\" --file-path \"$FP\" --cursor-row \"$ROW\" --text \"$TEXT\"",
+    "command": "/Users/sx.chen/.local/bin/zed-claude-bridge ipc-send-at-mention --workspace \"$HOME\" --workspace-root \"$WSR\" --file-path \"$FP\" --cursor-row \"$ROW\" --text \"$TEXT\"",
     "env": {
       "FP": "$ZED_FILE",
       "ROW": "$ZED_ROW",
-      "TEXT": "$ZED_SELECTED_TEXT"
+      "TEXT": "$ZED_SELECTED_TEXT",
+      "WSR": "$ZED_WORKTREE_ROOT",
     },
     "use_new_terminal": false,
     "allow_concurrent_runs": true,
-    "reveal": "never"
-  }
+    "reveal": "never",
+    "shell": { "program": "/bin/sh" },
+  },
 ]

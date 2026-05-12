@@ -59,7 +59,27 @@ q.on("connection", function(W, M){
 ```
 Reject with WS close code `1008`.
 
-**Single-client policy**: VSCode disconnects the previous client when a new one connects ("Disconnecting previous WebSocket client"). We will mirror that.
+**Optional workspace header** (Zed-sidecar extension, NOT part of the
+upstream protocol): the sidecar also reads an optional
+`x-claude-code-workspace: <absolute-path>` header on the upgrade
+request. When present, the value is canonicalized and used as the
+client's `workspace_root` for session-aware at-mention routing (see
+§9). Stylistically parallel to the auth header above: the value is
+inspected once in the tungstenite `accept_hdr` callback and stored on
+the registry entry. Claude Code v2.1.76 does not emit this header
+today, so the branch is no-op in practice — it exists for forward
+compatibility and for hand-rolled clients (e.g. tests) that wish to
+declare their workspace explicitly. The sidecar SHALL NOT reject a
+connection on the basis of this header's presence or absence.
+
+**Single-client policy (REMOVED in session-routing change)**: VSCode's
+extension.js disconnects the previous client on a new connect
+("Disconnecting previous WebSocket client"). The earlier Zed sidecar
+mirrored that. **It no longer does.** As of the `session-routing`
+OpenSpec change, the sidecar accepts many concurrent authorized
+clients and routes each outbound `at_mentioned` notification to
+exactly one of them via the rules in §9. Each connection runs to
+completion (peer close, EOF, transport error, or sidecar shutdown).
 
 **Frame format**: text frames carrying JSON-RPC 2.0. One JSON object per frame.
 
@@ -200,20 +220,81 @@ This is **our** invention, not part of Claude Code. We need it because the Zed W
 
 **Messages from extension → sidecar**:
 ```json
-{"type": "selection", "filePath": "...", "lineStart": 10, "lineEnd": 20, "text": "..."}
-{"type": "at_mention", "filePath": "...", "lineStart": 10, "lineEnd": 20}
+{"type": "selection", "file_path": "...", "line_start": 10, "line_end": 20, "text": "..."}
+{"type": "at_mention", "file_path": "...", "line_start": 10, "line_end": 20}
+{"type": "at_mention", "file_path": "...", "line_start": 10, "line_end": 20, "workspace_root": "/abs/zed/worktree"}
+{"type": "at_mention", "file_path": "...", "line_start": 10, "line_end": 20, "client_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"}
 {"type": "workspace_folders", "folders": ["/abs/path"]}
-{"type": "open_editors", "editors": [{"uri": "...", "isActive": true, ...}]}
+{"type": "open_editors", "editors": [{"uri": "...", "is_active": true, ...}]}
 {"type": "ping"}
 ```
 
-**Messages from sidecar → extension** (mostly for diagnostics):
+Note: field names in the IPC frames are **snake_case** because this
+protocol is internal to the Zed sidecar (unlike the camelCase
+Claude Code wire formats elsewhere in this document).
+
+The `at_mention` frame carries two optional fields used by the
+session-routing logic in §9:
+
+- **`workspace_root`** (string, optional): an absolute filesystem
+  path naming the Zed worktree from which the at-mention was
+  triggered. Populated by the Zed task from `$ZED_WORKTREE_ROOT`.
+  When present, the sidecar matches it against each registered
+  WebSocket client's workspace to pick a unique recipient (§9 rule
+  2). Both `workspace_root` and `client_id` are omitted entirely on
+  the wire when unset — pre-update CLI helpers continue to parse
+  correctly.
+- **`client_id`** (string, optional): the lowercase 36-character
+  hyphenated UUID v4 form of a registered WebSocket client. When
+  present, the sidecar routes directly to that client (§9 rule 1),
+  bypassing workspace matching. This field is set only on the
+  second leg of a picker round-trip (see below).
+
+**Messages from sidecar → extension** (diagnostics + routing
+disambiguation):
+
 ```json
 {"type": "ack"}
 {"type": "log", "level": "info", "message": "..."}
+{"type": "ambiguous", "candidates": [
+  {"client_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+   "label": "Session 1 — connected 2m ago",
+   "connected_at_ms_ago": 120000,
+   "last_activity_ms_ago": 3000}
+]}
 ```
 
-The sidecar maintains last-known editor state in memory and serves it when MCP `tools/call` requests come in from the CLI.
+The `ambiguous` frame is emitted only by the sidecar in reply to an
+`at_mention` whose `workspace_root` matched more than one registered
+WebSocket client (§9 rule 3). Each candidate object SHALL have
+exactly four keys: `client_id` (the lowercase hyphenated UUID v4 of
+the candidate WebSocket client), `label` (a non-empty UTF-8 string
+suitable for display in a picker dialog), `connected_at_ms_ago`
+(non-negative integer milliseconds since the client's WebSocket
+upgrade completed), and `last_activity_ms_ago` (non-negative integer
+milliseconds since the client's last JSON-RPC inbound frame).
+Helpers SHALL NOT send this frame; receiving one inbound is treated
+as a protocol-shape mistake and silently dropped.
+
+**Picker round-trip flow.** When the sidecar replies with
+`ambiguous`, the IPC connection stays open and the helper:
+
+1. Reads the `ambiguous` line.
+2. On macOS, invokes `osascript -e 'choose from list {…} with prompt
+   "…"'` synchronously with the candidates' `label` strings.
+3. Writes a second `at_mention` line on the **same** IPC connection
+   with `client_id` set to the picked candidate's UUID. The sidecar
+   routes directly to that client (rule 1).
+4. If the user cancels the dialog, the helper writes nothing and
+   exits 0 (the at-mention is intentionally dropped).
+
+On non-macOS platforms today, step 2 is replaced by a WARN log and a
+deterministic fallback to the candidate with the smallest
+`last_activity_ms_ago` (most-recently-active). A native Linux picker
+is tracked as a follow-up OpenSpec change.
+
+The sidecar maintains last-known editor state in memory and serves
+it when MCP `tools/call` requests come in from the CLI.
 
 ---
 
@@ -239,3 +320,96 @@ The sidecar maintains last-known editor state in memory and serves it when MCP `
 - Selection notification: search for `method:"selection_changed"` and `method:"at_mentioned"`
 - Tool registrations: search for `x.tool("getOpenEditors"`
 - MCP spec: https://modelcontextprotocol.io/specification/2024-11-05
+
+---
+
+## 9. Session-aware at-mention routing (Zed-sidecar extension)
+
+This section is project-local — it documents how the Zed sidecar
+routes outbound `at_mentioned` JSON-RPC notifications when multiple
+Claude Code sessions are connected at once. Upstream Claude Code
+(the CLI) is unaffected: from its perspective the wire shape is
+identical to §3.3.
+
+The full spec lives at `openspec/specs/notifications/spec.md` (with
+the session-routing delta at
+`openspec/changes/session-routing/specs/notifications/spec.md`).
+Summary:
+
+**Client registry.** The sidecar accepts many concurrent authorized
+WebSocket clients and tracks each in a registry. Per-client metadata:
+the registry `client_id` (UUID v4, opaque), an `mpsc::Sender` for
+outbound JSON-RPC notifications, the canonicalised `workspace_root`,
+the `connected_at` timestamp, and the `last_activity` timestamp
+(bumped on every inbound JSON-RPC frame).
+
+**Workspace identification.** Each registry entry's `workspace_root`
+is computed at WebSocket-accept time in priority order:
+
+1. `x-claude-code-workspace` request header (see §2). Optional;
+   absent in Claude Code v2.1.76 today, included for forward
+   compatibility.
+2. `params.clientInfo.cwd` on the MCP `initialize` request, if
+   present. The MCP spec doesn't define this field but allows
+   extensions; the sidecar tolerates it as an optional string.
+3. The sidecar's `--workspace` flag (last-resort default; for the
+   LaunchAgent deployment this is `$HOME`, which is too broad to
+   disambiguate but routing degrades gracefully — see rules below).
+
+**Routing rules (deterministic, total).** When an `at_mention` IPC
+frame arrives, the router decides among:
+
+1. **Direct `client_id` override.** If the frame's `client_id` is
+   `Some(id)` and that id exists in the registry → route to it. If
+   the id is stale (client disconnected between picker and
+   follow-up), log WARN and drop.
+2. **Workspace match — unique.** If the frame's `workspace_root` is
+   `Some(r)` and exactly one registered client has a canonical
+   `workspace_root` equal to `canonical(r)` → route to it.
+3. **Workspace match — multiple candidates → picker.** If the
+   frame's `workspace_root` is `Some(r)` and ≥2 registered clients
+   match → reply on the IPC connection with an `ambiguous` frame
+   and NOT emit a notification. The helper drives the picker (§6).
+4. **Singleton registry.** If the registry contains exactly one
+   client (regardless of workspace) → route to it.
+5. **No match.** Otherwise, log WARN with the frame's file path,
+   `workspace_root`, and the set of known workspaces; drop the
+   at-mention.
+
+**Selection-changed fan-out** (§3.3) is separate. The sidecar finds
+the **longest** registered `workspace_root` that is a path-component
+prefix of the source file's path, and delivers the
+`selection_changed` notification to every client whose workspace
+canonically equals that longest-prefix winner. If no registered
+workspace prefixes the file path, the notification fans out to ALL
+clients (preserves the pre-routing behaviour). Nested workspaces
+(e.g. one client at `/a` and another at `/a/inner`) are therefore
+disambiguated by the longer match: a file in `/a/inner/...` reaches
+only the `/a/inner` client.
+
+**Per-client backpressure.** Each client's outbound channel is a
+bounded `mpsc` (capacity 64). On send timeout (50 ms), the
+notification is dropped for that client with a WARN naming the
+`client_id`; other clients are not affected.
+
+**Picker mechanism (macOS).** The helper, not the daemon, runs
+`osascript -e 'choose from list {…} with prompt "…"'` synchronously
+on receipt of the `ambiguous` reply. This keeps each click isolated
+to its own helper process and avoids any blocking subprocess in the
+daemon. The Aqua-session LaunchAgent deployment supports this —
+`choose from list` requires only that the spawning process inherits
+the user's GUI session.
+
+**Picker mechanism (Linux, follow-up).** No native picker today.
+The helper logs a WARN and falls back to the candidate with the
+smallest `last_activity_ms_ago` (most-recently-active). Tracked as a
+separate OpenSpec change.
+
+**No `session_tag` mechanism.** An earlier design draft included an
+`x-claude-code-session-tag` header and a matching `--session-tag`
+CLI flag for explicit session identification. **That mechanism was
+removed.** Reasons: Claude CLI v2.1.76 does not emit it, Zed has no
+clean way to inject it into a hand-launched terminal, and the picker
+tiebreak makes it unnecessary. If a future Claude release ships a
+workspace or session identifier, it will be added in a follow-up
+OpenSpec change.

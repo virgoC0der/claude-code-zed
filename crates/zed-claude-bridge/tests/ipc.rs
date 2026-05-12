@@ -24,28 +24,56 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::timeout;
 
 use zed_claude_bridge::ipc::server::IpcServer;
 use zed_claude_bridge::mcp::EditorState;
 use zed_claude_bridge::protocol::Notification as JsonRpcNotification;
+use zed_claude_bridge::transport::{
+    CLIENT_CHANNEL_CAPACITY, ClientHandle, ClientId, ClientRegistry,
+};
 
 /// Spin up an `IpcServer` against a fresh socket inside a `TempDir`.
-/// Returns the socket path, a broadcast receiver to observe notifications,
-/// the shared state handle, and the `TempDir` itself (kept alive for the
-/// lifetime of the test).
+///
+/// Returns the socket path, an mpsc receiver representing the single
+/// "fake WebSocket client" registered with the server's
+/// [`ClientRegistry`] (so the tests can observe routed notifications),
+/// the shared state handle, and the `TempDir` itself (kept alive for
+/// the lifetime of the test).
+///
+/// The fake client is registered with no `workspace_root` — so the
+/// router's "singleton registry" rule (or "no workspace_root in
+/// frame") always fires, mirroring the pre-routing fan-out behaviour
+/// these tests originally asserted.
 async fn start_server() -> (
     std::path::PathBuf,
-    broadcast::Receiver<JsonRpcNotification>,
+    mpsc::Receiver<JsonRpcNotification>,
     Arc<RwLock<EditorState>>,
     TempDir,
 ) {
     let tmp = TempDir::new().unwrap();
     let socket_path = tmp.path().join("ipc.sock");
     let state = Arc::new(RwLock::new(EditorState::new()));
-    let (notifier, rx) = broadcast::channel::<JsonRpcNotification>(128);
-    let server = IpcServer::new(state.clone(), notifier);
+    let registry = ClientRegistry::new();
+
+    // Pre-register a "fake WebSocket client" so the IPC server has
+    // somewhere to route to. The router's singleton rule fires when
+    // the IPC frame has no workspace_root (or it has one but no
+    // workspace_root matches yet only one client is registered, which
+    // is also a singleton route).
+    let (tx, rx) = mpsc::channel::<JsonRpcNotification>(CLIENT_CHANNEL_CAPACITY);
+    let now = tokio::time::Instant::now();
+    let handle = ClientHandle {
+        id: ClientId::new(),
+        tx,
+        workspace_root: None,
+        last_activity: now,
+        connected_at: now,
+    };
+    registry.insert(handle).await;
+
+    let server = IpcServer::new(state.clone(), registry);
     let listener = IpcServer::bind(&socket_path).expect("bind");
     let server_clone = server.clone();
     tokio::spawn(async move {
@@ -95,10 +123,10 @@ where
 }
 
 async fn next_notification(
-    rx: &mut broadcast::Receiver<JsonRpcNotification>,
+    rx: &mut mpsc::Receiver<JsonRpcNotification>,
     within: Duration,
 ) -> Option<JsonRpcNotification> {
-    timeout(within, rx.recv()).await.ok().and_then(Result::ok)
+    timeout(within, rx.recv()).await.ok().flatten()
 }
 
 // ---------------------------------------------------------------------------

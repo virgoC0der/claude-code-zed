@@ -57,7 +57,7 @@ Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed edi
 - placement_rules:
   - All wire types (JSON-RPC, lock-file JSON, IPC frames) live under `protocol/` with explicit `#[derive(Serialize, Deserialize)]`. No ad-hoc `serde_json::json!` outside this module.
   - I/O (sockets, files, env) MUST NOT appear in `protocol/` or `mcp/`.
-  - `unsafe` is forbidden.
+  - `unsafe` is forbidden EXCEPT in `crates/zed-claude-bridge/src/transport/cwd_resolver.rs`, where narrow `unsafe` blocks are permitted at FFI / POD-union boundaries (macOS `libproc` integration). Each block MUST carry a `// SAFETY:` comment explaining the invariant. Hard limit: **2 blocks** — one for the `libc::proc_pidinfo` FFI call that reads a process's `proc_vnodepathinfo` (cwd), and one for the `libproc::libproc::net_info::SocketInfoProto` / `InSIAddr` union access needed to read a socket fd's local port. Add no other `unsafe` usage to the project. The exemption applies only to this file; the rest of the codebase remains `unsafe`-free per the layer rules.
   - Async runtime is **tokio**; no blocking calls inside async fns.
   - The WebSocket library is **tokio-tungstenite** (with `rustls` disabled — local plaintext only).
   - Lock-file permissions: file `0600`, parent dir `0700`. Verify on every write.

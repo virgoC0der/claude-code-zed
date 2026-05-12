@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
@@ -16,12 +16,13 @@ use tracing_subscriber::EnvFilter;
 use crate::app::cli::{
     Cli, Command, DaemonArgs, IpcSendAtMentionArgs, IpcSendWorkspaceFoldersArgs, resolve_line_range,
 };
+use crate::app::picker;
 use crate::ipc;
 use crate::ipc::server::IpcServer;
 use crate::lockfile::LockDir;
 use crate::mcp::EditorState;
 use crate::protocol::{IpcFrame, LockFile};
-use crate::transport::{AuthToken, Transport, bind_random};
+use crate::transport::{AuthToken, Transport, bind_random, default_cwd_resolver};
 
 /// Top-level entrypoint called from `main.rs`.
 ///
@@ -78,10 +79,34 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         .write_lock(port, &body)
         .with_context(|| format!("writing lock file for port {port}"))?;
 
-    // 5. Build shared state + transport (which owns the broadcast notifier).
+    // 5. Build shared state + transport (which owns the client
+    //    registry). Production wiring threads in BOTH:
+    //    - the daemon's `--workspace` flag as the **priority-4**
+    //      last-resort fallback (websocket spec "Defaults to
+    //      --workspace when no client-side and no peer-cwd signal"
+    //      scenario), and
+    //    - the platform-default `CwdResolver` for **priority 2**
+    //      (peer-process cwd discovery). On macOS this is
+    //      `LibprocCwdResolver` (libproc-backed); on every other
+    //      platform it is `NoopCwdResolver` (returns None for every
+    //      peer, preserving today's behaviour).
+    //
+    //    We use the explicit `Transport::builder(...)` chain rather
+    //    than the legacy `Transport::with_daemon_workspace` so the
+    //    resolver wiring is greppable from this single call site
+    //    — easier to audit and to swap in a custom resolver from a
+    //    test or a debug binary.
     let state = Arc::new(RwLock::new(EditorState::new()));
-    let transport = Transport::new(auth, state.clone());
-    let notifier = transport.notifier();
+    let cwd_resolver = default_cwd_resolver();
+    info!(
+        target_os = std::env::consts::OS,
+        "cwd resolver configured (peer-process cwd discovery, priority 2)"
+    );
+    let transport = Transport::builder(auth, state.clone())
+        .with_daemon_workspace(workspace.clone())
+        .with_cwd_resolver(cwd_resolver)
+        .build();
+    let registry = transport.registry();
 
     // 6. Bind the IPC socket.
     let socket_path = args
@@ -90,7 +115,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| ipc::socket_path(&workspace));
     let ipc_listener = IpcServer::bind(&socket_path)
         .with_context(|| format!("binding IPC socket at {}", socket_path.display()))?;
-    let ipc_server = IpcServer::new(state, notifier);
+    let ipc_server = IpcServer::new(state, registry);
 
     // 7. Drive both accept loops on background tasks. Errors from these are
     //    logged but do not abort the process — accept loops are infinite.
@@ -166,12 +191,118 @@ async fn run_ipc_send_at_mention(args: IpcSendAtMentionArgs) -> anyhow::Result<(
         .unwrap_or_else(|| ipc::socket_path(&args.workspace));
     let (line_start, line_end) =
         resolve_line_range(&args).map_err(|msg| anyhow::anyhow!("{msg}"))?;
-    let frame = IpcFrame::AtMention {
-        file_path: args.file_path,
+    let initial_frame = IpcFrame::AtMention {
+        file_path: args.file_path.clone(),
         line_start,
         line_end,
+        workspace_root: args.workspace_root.clone(),
+        client_id: args.client_id,
     };
-    send_one_frame(&socket_path, &frame).await
+
+    // Open the connection and keep it for the picker round-trip (if any).
+    let stream = UnixStream::connect(&socket_path)
+        .await
+        .with_context(|| format!("connecting to IPC socket at {}", socket_path.display()))?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Write the first frame.
+    write_frame(&mut write_half, &initial_frame).await?;
+
+    // The sidecar always writes one reply on the same connection:
+    // `IpcFrame::Ack` for direct routes (DirectClient /
+    // WorkspaceUnique / Singleton), or `IpcFrame::Ambiguous` when
+    // the workspace match was non-unique. Reading the reply lets us
+    // close as soon as the sidecar confirms routing — without it we
+    // would block for the full timeout below on every send.
+    let reply_line = read_one_line_with_timeout(&mut reader, std::time::Duration::from_millis(500))
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(line) = reply_line {
+        match serde_json::from_str::<IpcFrame>(&line) {
+            Ok(IpcFrame::Ack) => {
+                // Direct route succeeded; nothing more to do.
+            }
+            Ok(IpcFrame::Ambiguous { candidates }) => {
+                // Picker round-trip. On macOS this presents a native
+                // `choose from list` dialog; on other platforms it
+                // falls back to most-recently-active. Cancellation
+                // yields None, which we treat as an intentional drop
+                // (no follow-up frame; exit 0).
+                if let Some(picked_uuid) = picker::pick_candidate(&candidates) {
+                    let followup = IpcFrame::AtMention {
+                        file_path: args.file_path,
+                        line_start,
+                        line_end,
+                        workspace_root: args.workspace_root,
+                        client_id: Some(picked_uuid),
+                    };
+                    write_frame(&mut write_half, &followup).await?;
+                } else {
+                    debug!("picker cancelled; sending no follow-up frame");
+                }
+            }
+            Ok(other) => {
+                debug!(?other, "ignoring unexpected IPC reply");
+            }
+            Err(e) => {
+                debug!(error = %e, line = %line, "ignoring unparseable IPC reply");
+            }
+        }
+    }
+
+    // Cleanly close. The launchd-spawned-helper drain workaround
+    // (`send_one_frame`'s 50ms sleep) is not needed here: the read
+    // of `Ack` / `Ambiguous` above proves the sidecar has already
+    // consumed our write, so there are no in-flight bytes to lose.
+    let _ = write_half.flush().await;
+    let _ = write_half.shutdown().await;
+    Ok(())
+}
+
+/// Serialize `frame` as a single line-delimited JSON record and write
+/// it to `stream`. Flushes after the write so the daemon sees the
+/// bytes promptly.
+async fn write_frame(
+    stream: &mut tokio::net::unix::OwnedWriteHalf,
+    frame: &IpcFrame,
+) -> anyhow::Result<()> {
+    let mut bytes = serde_json::to_vec(frame).context("serialising IPC frame")?;
+    bytes.push(b'\n');
+    stream
+        .write_all(&bytes)
+        .await
+        .context("writing IPC frame")?;
+    stream.flush().await.context("flushing IPC frame")?;
+    Ok(())
+}
+
+/// Read one `\n`-terminated line from `reader`, with a hard timeout.
+/// Returns `Ok(None)` on EOF, `Ok(Some(line))` on success, and
+/// `Err(_)` only on the timeout case.
+async fn read_one_line_with_timeout<R>(
+    reader: &mut BufReader<R>,
+    within: std::time::Duration,
+) -> anyhow::Result<Option<String>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    let res = tokio::time::timeout(within, reader.read_line(&mut line)).await;
+    match res {
+        Ok(Ok(0)) => Ok(None), // EOF
+        Ok(Ok(_)) => {
+            // Strip trailing newline (and optional \r).
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            Ok(Some(line))
+        }
+        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+        Err(_) => Err(anyhow::anyhow!("read timed out after {:?}", within)),
+    }
 }
 
 async fn run_ipc_send_workspace_folders(args: IpcSendWorkspaceFoldersArgs) -> anyhow::Result<()> {
