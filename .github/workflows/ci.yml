@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  ci:
+    name: fmt + clippy + test
+    # macOS is required because peer-cwd-discovery uses libproc (target_os = "macos").
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins channel = "stable" + rustfmt + clippy.
+        # actions-rust-lang/setup-rust-toolchain reads it automatically.
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+
+      - name: format_check
+        run: cargo fmt --all --check
+
+      - name: lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
