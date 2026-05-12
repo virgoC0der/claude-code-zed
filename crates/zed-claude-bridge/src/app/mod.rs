@@ -6,6 +6,8 @@
 
 pub mod cli;
 pub mod lifecycle;
+pub mod picker;
 
 pub use cli::Cli;
 pub use lifecycle::run;
+pub use picker::pick_candidate;

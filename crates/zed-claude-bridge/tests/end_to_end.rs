@@ -31,7 +31,7 @@ use zed_claude_bridge::ipc::server::IpcServer;
 use zed_claude_bridge::lockfile::LockDir;
 use zed_claude_bridge::mcp::EditorState;
 use zed_claude_bridge::protocol::LockFile;
-use zed_claude_bridge::transport::{AuthToken, Transport, bind_random};
+use zed_claude_bridge::transport::{AuthToken, NoopCwdResolver, Transport, bind_random};
 
 /// Stand up the full sidecar stack against a `TempDir` for the lock dir
 /// and a `TempDir`-derived path for the IPC socket. Returns:
@@ -62,11 +62,19 @@ async fn start_full_stack() -> (std::path::PathBuf, std::path::PathBuf, u16, Tem
     };
     lock_dir.write_lock(port, &body).expect("write lock");
 
-    // 3. IPC server + transport (sharing the broadcast notifier).
+    // 3. IPC server + transport (sharing the client registry).
+    //    `NoopCwdResolver` is injected so the test process's
+    //    real cwd is NOT auto-resolved as a priority-2
+    //    workspace; without this, the new peer-cwd-discovery
+    //    behaviour would silently fill `workspace_root` with
+    //    the test runner's cwd, defeating any test that
+    //    expects priority-3 / priority-4 to fire.
     let state = Arc::new(RwLock::new(EditorState::new()));
-    let transport = Transport::new(auth, state.clone());
-    let notifier = transport.notifier();
-    let ipc_server = IpcServer::new(state, notifier);
+    let transport = Transport::builder(auth, state.clone())
+        .with_cwd_resolver(Arc::new(NoopCwdResolver::new()))
+        .build();
+    let registry = transport.registry();
+    let ipc_server = IpcServer::new(state, registry);
     let ipc_listener = IpcServer::bind(&socket_path).expect("bind ipc");
 
     // 4. Spawn both accept loops.

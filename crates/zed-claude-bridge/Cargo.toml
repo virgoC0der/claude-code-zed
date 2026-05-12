@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 # xxhash-rust: required by `specs/ipc/spec.md` to compute the workspace-hash
 # component of `$TMPDIR/zed-claude-bridge-<xxh3-hex>.sock` so the Zed extension
 # and the sidecar agree on the IPC socket path. xxh3_64 is non-cryptographic;
@@ -41,3 +41,21 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs", "process"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 http = "1"
+
+# macOS-only deps used exclusively by
+# `transport::cwd_resolver::LibprocCwdResolver`:
+# - `libproc` provides the safe-Rust wrapper for
+#   `proc_listallpids` / `proc_pidfdinfo<SocketFDInfo>`. Pinned to the
+#   0.14 minor (current stable 0.14.11).
+# - `libc` is declared explicitly (per team-lead decision recorded in
+#   task #8's blocker resolution) rather than relying on a transitive
+#   pull-in from tokio. We need `libc::proc_pidinfo`,
+#   `libc::PROC_PIDVNODEPATHINFO`, and `libc::proc_vnodepathinfo` to
+#   read a target PID's cwd directly — libproc 0.14 does not expose a
+#   safe wrapper for `VNodePathInfo` (confirmed in the libproc source
+#   inspection recorded in design.md D2). This is one of the two
+#   narrow `unsafe`-permitted FFI boundaries authorised by the
+#   `.harness/project.md` exception.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+libproc = "0.14"

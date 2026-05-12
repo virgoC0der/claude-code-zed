@@ -12,7 +12,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/sx-chen/claude-code-zed"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `unsafe_code` is denied workspace-wide. The only exemption is
+# `crates/zed-claude-bridge/src/transport/cwd_resolver.rs`, which
+# carries a module-scoped `#![allow(unsafe_code)]` for two narrow
+# FFI / POD-union sites authorised by `.harness/project.md`. Adding
+# any other `unsafe` block requires updating that policy first.
+# `deny` (not `forbid`) is required so the per-module `allow` works.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

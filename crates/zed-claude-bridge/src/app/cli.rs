@@ -91,6 +91,22 @@ pub struct DaemonArgs {
 ///
 /// At least one of (`--line-start`+`--line-end`), `--text`, or
 /// `--cursor-row` must be supplied; otherwise the CLI exits with an error.
+///
+/// **Session routing.** Two optional flags drive the
+/// `session-routing` change's at-mention router:
+///
+/// - `--workspace-root <PATH>`: the absolute path of the Zed worktree
+///   from which this at-mention was triggered. Typically populated
+///   from `$ZED_WORKTREE_ROOT` by the Zed task. **Distinct from
+///   `--workspace`**: `--workspace` names the IPC socket scope (the
+///   directory whose hash forms the socket file name), while
+///   `--workspace-root` is forwarded into the IPC frame's
+///   `workspace_root` field so the sidecar's router can pick a
+///   recipient WebSocket client by workspace.
+/// - `--client-id <UUID>`: the registry id of a specific WebSocket
+///   client to route directly to. **Normally set internally by the
+///   helper on the picker's follow-up leg** (i.e. after a macOS
+///   `osascript choose from list` dialog), not by end users.
 #[derive(Debug, Args)]
 pub struct IpcSendAtMentionArgs {
     /// Workspace root used to derive the IPC socket path.
@@ -127,6 +143,21 @@ pub struct IpcSendAtMentionArgs {
     /// can't be located.
     #[arg(long, value_name = "N")]
     pub cursor_row: Option<u32>,
+
+    /// Zed worktree root for session-aware at-mention routing. Forwarded
+    /// into the IPC frame's `workspace_root` field. Distinct from
+    /// `--workspace` (see the struct's rustdoc). Typically populated
+    /// from `$ZED_WORKTREE_ROOT`.
+    #[arg(long, value_name = "PATH")]
+    pub workspace_root: Option<PathBuf>,
+
+    /// Direct-route override: the registry id of a specific WebSocket
+    /// client to deliver this at-mention to. Bypasses workspace
+    /// matching. Set internally by the helper on the picker's
+    /// follow-up leg; end users do not normally set it. Malformed
+    /// UUIDs are rejected at parse time with a typed error.
+    #[arg(long, value_name = "UUID", value_parser = clap::value_parser!(uuid::Uuid))]
+    pub client_id: Option<uuid::Uuid>,
 }
 
 /// Arguments for `ipc-send-workspace-folders`.
@@ -400,6 +431,111 @@ mod tests {
     }
 
     #[test]
+    fn parses_ipc_send_at_mention_with_workspace_root() {
+        // Spec scenario: "--workspace-root populates the frame field".
+        let cli = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/tmp/ws",
+            "--workspace-root",
+            "/Users/me/proj",
+            "--file-path",
+            "/Users/me/proj/x.rs",
+            "--cursor-row",
+            "5",
+        ])
+        .expect("parse");
+        match cli.command.expect("subcommand present") {
+            Command::IpcSendAtMention(a) => {
+                assert_eq!(
+                    a.workspace_root.as_deref(),
+                    Some(std::path::Path::new("/Users/me/proj"))
+                );
+                assert!(a.client_id.is_none());
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ipc_send_at_mention_with_valid_client_id() {
+        // Spec scenario: "--client-id populates the frame field".
+        let cli = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/tmp/ws",
+            "--client-id",
+            "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+            "--file-path",
+            "/x.rs",
+            "--cursor-row",
+            "1",
+        ])
+        .expect("parse");
+        match cli.command.expect("subcommand present") {
+            Command::IpcSendAtMention(a) => {
+                assert_eq!(
+                    a.client_id,
+                    Some(
+                        uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+                            .expect("uuid")
+                    )
+                );
+                assert!(a.workspace_root.is_none());
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_ipc_send_at_mention_with_malformed_client_id() {
+        // Spec scenario: "--client-id rejects malformed UUIDs".
+        // clap's value_parser!(uuid::Uuid) rejects with a typed error
+        // BEFORE any IPC frame is written.
+        let res = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/tmp/ws",
+            "--client-id",
+            "not-a-uuid",
+            "--file-path",
+            "/x.rs",
+            "--cursor-row",
+            "1",
+        ]);
+        assert!(
+            res.is_err(),
+            "malformed --client-id SHALL reject at parse time"
+        );
+    }
+
+    #[test]
+    fn ipc_send_at_mention_omits_routing_fields_when_not_provided() {
+        // Spec scenario: "Omitting both yields None for both".
+        let cli = Cli::try_parse_from([
+            "zed-claude-bridge",
+            "ipc-send-at-mention",
+            "--workspace",
+            "/tmp/ws",
+            "--file-path",
+            "/x.rs",
+            "--cursor-row",
+            "1",
+        ])
+        .expect("parse");
+        match cli.command.expect("subcommand present") {
+            Command::IpcSendAtMention(a) => {
+                assert!(a.workspace_root.is_none());
+                assert!(a.client_id.is_none());
+            }
+            other => panic!("wrong subcommand: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_ipc_send_workspace_folders() {
         let cli = Cli::try_parse_from([
             "zed-claude-bridge",
@@ -453,6 +589,8 @@ mod tests {
             line_end,
             text: text.map(String::from),
             cursor_row,
+            workspace_root: None,
+            client_id: None,
         }
     }
 
