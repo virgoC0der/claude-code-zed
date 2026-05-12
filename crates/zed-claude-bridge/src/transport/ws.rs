@@ -382,6 +382,9 @@ impl Transport {
 
         let auth_status_for_cb = auth_status.clone();
         let workspace_for_cb = workspace_header.clone();
+        // The Result type comes from tokio-tungstenite's handshake API; we
+        // can't shrink it. The lint fires on Rust 1.95+ stable.
+        #[allow(clippy::result_large_err)]
         let callback =
             move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
                 // Header lookup via `http::HeaderMap` — case-insensitive.
