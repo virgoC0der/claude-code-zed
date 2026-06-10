@@ -157,6 +157,18 @@ pub async fn bind_random(max_retries: usize) -> Result<(TcpListener, u16), Trans
     })
 }
 
+/// Bind exactly `port` on IPv4 loopback. Unlike [`bind_random`], any bind
+/// failure (including `AddrInUse`) is returned immediately — a
+/// user-specified fixed port is explicit intent, so we fail fast rather
+/// than silently fall back to a random port.
+pub async fn bind_fixed(port: u16) -> Result<(TcpListener, u16), TransportError> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    match TcpListener::bind(addr).await {
+        Ok(listener) => Ok((listener, port)),
+        Err(e) => Err(TransportError::Io(e)),
+    }
+}
+
 fn random_port_in_range() -> u16 {
     // Use UUID v4's randomness rather than pulling in a new dep. We take 4
     // bytes to seed a u32 and modulo it into [MIN_PORT, MAX_PORT].
@@ -828,6 +840,25 @@ mod tests {
         assert!(matches!(addr.ip(), IpAddr::V4(_)), "must be IPv4");
         assert_eq!(addr.port(), port);
         assert!((MIN_PORT..=MAX_PORT).contains(&port));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_fixed_binds_the_requested_port() {
+        // Grab a free port from the OS, release it, then bind it fixed.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (listener, got) = bind_fixed(port).await.expect("bind_fixed");
+        assert_eq!(got, port);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_fixed_fails_fast_when_port_taken() {
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let err = bind_fixed(port).await.expect_err("must fail while held");
+        assert!(matches!(err, TransportError::Io(_)));
     }
 
     /// Acceptance criterion for tasks.md §4.1: the new builder API

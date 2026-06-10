@@ -22,7 +22,7 @@ use crate::ipc::server::IpcServer;
 use crate::lockfile::LockDir;
 use crate::mcp::EditorState;
 use crate::protocol::{IpcFrame, LockFile};
-use crate::transport::{AuthToken, Transport, bind_random, default_cwd_resolver};
+use crate::transport::{AuthToken, Transport, bind_fixed, bind_random, default_cwd_resolver};
 use crate::zed_watch::{self, WatchConfig};
 
 /// Top-level entrypoint called from `main.rs`.
@@ -62,9 +62,14 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     info!("auth token generated");
 
     // 3. Bind the WebSocket listener.
-    let (ws_listener, port) = bind_random(16)
-        .await
-        .context("binding WebSocket listener")?;
+    let (ws_listener, port) = match args.port {
+        Some(p) => bind_fixed(p).await.with_context(|| {
+            format!("binding fixed WebSocket port {p} (is another sidecar running?)")
+        })?,
+        None => bind_random(16)
+            .await
+            .context("binding WebSocket listener")?,
+    };
     info!(port, "websocket listener bound on 127.0.0.1");
 
     // 4. Write the lock file so `/ide` can find us.

@@ -82,6 +82,13 @@ pub struct DaemonArgs {
     /// and non-standard installs.
     #[arg(long, value_name = "PATH")]
     pub zed_db_path: Option<PathBuf>,
+
+    /// Fixed WebSocket port. When set, the sidecar binds exactly this port
+    /// (failing fast if it is taken) instead of picking a random one in
+    /// [10000, 65535]. Pair with `CLAUDE_CODE_SSE_PORT=<N>` in your shell or
+    /// Zed terminal env so `claude` auto-connects without `/ide`.
+    #[arg(long, value_name = "N")]
+    pub port: Option<u16>,
 }
 
 /// Arguments for `ipc-send-at-mention`.
@@ -344,6 +351,18 @@ mod tests {
             Some(std::path::Path::new("/tmp/sock"))
         );
         assert_eq!(cli.daemon.lock_dir, PathBuf::from("/tmp/locks"));
+    }
+
+    #[test]
+    fn daemon_port_flag_parses() {
+        let cli = Cli::parse_from(["zed-claude-bridge", "--workspace", "/w", "--port", "52840"]);
+        assert_eq!(cli.daemon.port, Some(52840));
+    }
+
+    #[test]
+    fn daemon_port_flag_defaults_to_none() {
+        let cli = Cli::parse_from(["zed-claude-bridge", "--workspace", "/w"]);
+        assert_eq!(cli.daemon.port, None);
     }
 
     #[test]

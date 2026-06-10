@@ -20,6 +20,12 @@
         <string>__BIN__</string>
         <string>--workspace</string>
         <string>__HOME__</string>
+        <!--
+          Stable port so CLAUDE_CODE_SSE_PORT=52840 auto-connects `claude`
+          without /ide. Change or remove if 52840 collides on your machine.
+        -->
+        <string>--port</string>
+        <string>52840</string>
         <string>--foreground</string>
         <string>--log-level</string>
         <string>info</string>
