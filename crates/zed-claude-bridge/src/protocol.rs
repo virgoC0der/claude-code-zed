@@ -362,6 +362,41 @@ impl AtMentionedParams {
     }
 }
 
+/// Arguments for the `openFile` MCP tool (§3.2). Wire field names are
+/// camelCase; serde defaults mirror the VSCode extension's schema
+/// (`preview=false`, `selectToEndOfLine=false`, `makeFrontmost=true`).
+///
+/// Zed-capability notes: `preview`, `endText`, `selectToEndOfLine`, and
+/// `makeFrontmost=false` are ACCEPTED for wire compatibility but have no
+/// effect — the `zed` CLI can only position a cursor (`path:line:col`) in a
+/// focused window; it cannot set selections or open in the background.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenFileArgs {
+    /// Path to the file to open (absolute, or relative to the first
+    /// workspace folder).
+    pub file_path: String,
+    /// Preview-mode hint. Ignored (see type docs).
+    #[serde(default)]
+    pub preview: bool,
+    /// Text pattern locating the cursor position (first occurrence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_text: Option<String>,
+    /// Selection end pattern. Ignored (see type docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_text: Option<String>,
+    /// Ignored (see type docs).
+    #[serde(default)]
+    pub select_to_end_of_line: bool,
+    /// Focus hint. Effectively always true with the `zed` CLI.
+    #[serde(default = "default_true")]
+    pub make_frontmost: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Internal IPC frames (Zed extension ↔ sidecar)
 // ---------------------------------------------------------------------------
@@ -636,6 +671,35 @@ mod tests {
         assert_eq!(parsed.file_path, "/relative/or/abs/path.rs");
         assert_eq!(parsed.line_start, 10);
         assert_eq!(parsed.line_end, 20);
+    }
+
+    // ----- openFile args ---------------------------------------------------
+
+    #[test]
+    fn open_file_args_minimal_applies_defaults() {
+        let v: OpenFileArgs = serde_json::from_str(r#"{"filePath":"/a/b.rs"}"#).unwrap();
+        assert_eq!(v.file_path, "/a/b.rs");
+        assert!(!v.preview);
+        assert!(v.start_text.is_none());
+        assert!(v.end_text.is_none());
+        assert!(!v.select_to_end_of_line);
+        assert!(v.make_frontmost, "makeFrontmost defaults to true");
+    }
+
+    #[test]
+    fn open_file_args_full_roundtrip_camel_case() {
+        let json = r#"{"filePath":"/p","preview":true,"startText":"fn main","endText":"}","selectToEndOfLine":true,"makeFrontmost":false}"#;
+        let v: OpenFileArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(v.start_text.as_deref(), Some("fn main"));
+        assert!(!v.make_frontmost);
+        let back = serde_json::to_value(&v).unwrap();
+        assert_eq!(back["filePath"], "/p");
+        assert_eq!(back["startText"], "fn main");
+    }
+
+    #[test]
+    fn open_file_args_missing_file_path_fails() {
+        assert!(serde_json::from_str::<OpenFileArgs>("{}").is_err());
     }
 
     // ----- JSON-RPC envelope --------------------------------------------
