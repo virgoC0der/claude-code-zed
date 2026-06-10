@@ -98,8 +98,13 @@ struct PushState {
 /// `daemon_workspace` is the sidecar's own `--workspace` value; a client whose
 /// `workspace_root` equals it (i.e. no more-specific cwd was resolved) is
 /// skipped to avoid false matches on an over-broad root like `$HOME`.
+///
+/// Takes `&mut Connection` (not `&Connection`): `rusqlite::Connection` is
+/// `Send` but not `Sync`, so a shared reference held across the `.await`s in
+/// this fn would make the future non-`Send` and unusable with `tokio::spawn`.
+/// A unique reference is `Send` whenever the referent is.
 async fn refresh_once(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     registry: &ClientRegistry,
     state: &Arc<RwLock<EditorState>>,
     daemon_workspace: &Path,
@@ -215,8 +220,15 @@ pub async fn run(
             while rx.try_recv().is_ok() {}
         }
         match open_ro(&db_path) {
-            Ok(conn) => {
-                refresh_once(&conn, &registry, &state, &daemon_workspace, &mut push_state).await;
+            Ok(mut conn) => {
+                refresh_once(
+                    &mut conn,
+                    &registry,
+                    &state,
+                    &daemon_workspace,
+                    &mut push_state,
+                )
+                .await;
             }
             Err(e) => warn!(error = %e, "reopening Zed DB failed; will retry"),
         }
@@ -313,13 +325,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_pushes_active_file_to_matching_client() {
-        let conn = seed_db();
+        let mut conn = seed_db();
         let reg = ClientRegistry::new();
         let (_id, mut rx) = register(&reg, "/proj").await;
         let state = Arc::new(RwLock::new(EditorState::new()));
         let mut ps = PushState::default();
 
-        refresh_once(&conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
 
         // EditorState updated.
         let s = state.read().await;
@@ -333,29 +345,29 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_dedups_unchanged_active_file() {
-        let conn = seed_db();
+        let mut conn = seed_db();
         let reg = ClientRegistry::new();
         let (_id, mut rx) = register(&reg, "/proj").await;
         let state = Arc::new(RwLock::new(EditorState::new()));
         let mut ps = PushState::default();
 
-        refresh_once(&conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
         let _ = rx.try_recv().expect("first push");
         // Second cycle with no DB change -> no new push.
-        refresh_once(&conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
         assert!(rx.try_recv().is_err(), "no second push for unchanged file");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_skips_client_with_daemon_workspace_cwd() {
-        let conn = seed_db();
+        let mut conn = seed_db();
         let reg = ClientRegistry::new();
         // Client cwd == daemon workspace -> skipped.
         let (_id, mut rx) = register(&reg, "/daemon-ws").await;
         let state = Arc::new(RwLock::new(EditorState::new()));
         let mut ps = PushState::default();
 
-        refresh_once(&conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
         assert!(
             rx.try_recv().is_err(),
             "over-broad cwd client must be skipped"

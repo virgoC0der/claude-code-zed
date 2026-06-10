@@ -23,6 +23,7 @@ use crate::lockfile::LockDir;
 use crate::mcp::EditorState;
 use crate::protocol::{IpcFrame, LockFile};
 use crate::transport::{AuthToken, Transport, bind_random, default_cwd_resolver};
+use crate::zed_watch::{self, WatchConfig};
 
 /// Top-level entrypoint called from `main.rs`.
 ///
@@ -115,7 +116,8 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| ipc::socket_path(&workspace));
     let ipc_listener = IpcServer::bind(&socket_path)
         .with_context(|| format!("binding IPC socket at {}", socket_path.display()))?;
-    let ipc_server = IpcServer::new(state, registry);
+    let state_for_watch_clone = state.clone();
+    let ipc_server = IpcServer::new(state, registry.clone());
 
     // 7. Drive both accept loops on background tasks. Errors from these are
     //    logged but do not abort the process — accept loops are infinite.
@@ -130,6 +132,28 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         }
     });
 
+    // 7b. Optionally start the Zed active-file watcher. Failure to start
+    //     (DB not found / schema mismatch / non-macOS) disables the feature
+    //     with a WARN but never aborts the sidecar.
+    let watch_handle = if args.no_watch_zed_db {
+        info!("zed active-file watcher disabled via --no-watch-zed-db");
+        None
+    } else {
+        let config = WatchConfig {
+            db_path: args.zed_db_path.clone(),
+        };
+        let registry_for_watch = registry.clone();
+        let state_for_watch = state_for_watch_clone.clone();
+        let daemon_ws = workspace.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) =
+                zed_watch::run(config, registry_for_watch, state_for_watch, daemon_ws).await
+            {
+                warn!(error = %e, "zed active-file watcher disabled");
+            }
+        }))
+    };
+
     // 8. Wait for SIGINT / SIGTERM / SIGHUP.
     let shutdown = wait_for_shutdown_signal().await;
     info!(reason = shutdown, "shutdown signal received; cleaning up");
@@ -137,6 +161,9 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // 9. Stop accepting and unlink lock + socket files. Best-effort.
     ws_handle.abort();
     ipc_handle.abort();
+    if let Some(h) = watch_handle {
+        h.abort();
+    }
     if let Err(e) = lock_dir.remove_lock(port) {
         warn!(error = %e, port, "failed to remove lock file; continuing");
     }
