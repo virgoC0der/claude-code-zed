@@ -11,3 +11,4 @@ pub mod lockfile;
 pub mod mcp;
 pub mod protocol;
 pub mod transport;
+pub mod zed_watch;
