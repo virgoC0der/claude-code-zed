@@ -86,6 +86,29 @@ claude-code-zed/
 - For the manual smoke harness only: [`jq`](https://jqlang.org/) and
   [`websocat`](https://github.com/vi/websocat).
 
+## Install
+
+### Homebrew (recommended)
+
+```bash
+brew install virgoC0der/tap/zed-claude-bridge
+
+# Run the sidecar as a login service (workspace $HOME, fixed port 52840):
+brew services start zed-claude-bridge
+```
+
+`brew services` manages the launchd agent for you — it replaces the
+manual LaunchAgent setup under [*Run the sidecar*](#run-the-sidecar)
+below. Logs land in `$(brew --prefix)/var/log/zed-claude-bridge.log`.
+Prebuilt binaries cover Apple Silicon and Intel macs; checksums ship
+with every [GitHub Release](https://github.com/virgoC0der/claude-code-zed/releases).
+
+### From source
+
+```bash
+cargo install --path crates/zed-claude-bridge
+```
+
 ## Build
 
 ```bash
