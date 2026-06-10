@@ -413,3 +413,12 @@ clean way to inject it into a hand-launched terminal, and the picker
 tiebreak makes it unnecessary. If a future Claude release ships a
 workspace or session identifier, it will be added in a follow-up
 OpenSpec change.
+
+**Internal source: active-file watcher (Zed-sidecar extension).** In addition
+to IPC-frame-driven `selection_changed` notifications (from the `cmd-ctrl-c`
+task), the sidecar may emit `selection_changed` / refresh `getOpenEditors`
+from its Zed SQLite watcher (`src/zed_watch/`). These notifications carry an
+empty selection (`isEmpty: true`, no text) and convey only the active file
+path. They are routed directly to the single Claude session whose cwd matches
+the file's worktree — never broadcast. Upstream Claude Code sees a wire shape
+identical to §3.3.
