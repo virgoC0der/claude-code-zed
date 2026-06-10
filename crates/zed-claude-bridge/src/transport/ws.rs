@@ -27,8 +27,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::mcp::{EditorState, McpResponse, dispatch};
 use crate::protocol::{
-    Error as JsonRpcError, Notification as JsonRpcNotification, Request as JsonRpcRequest,
-    RequestId, Response as JsonRpcResponse, error_code,
+    Notification as JsonRpcNotification, Request as JsonRpcRequest, RequestId,
+    Response as JsonRpcResponse,
 };
 use crate::transport::cwd_resolver::{CwdResolver, default_cwd_resolver};
 use crate::transport::registry::{CLIENT_CHANNEL_CAPACITY, ClientHandle, ClientId, ClientRegistry};
@@ -239,6 +239,10 @@ pub struct Transport {
     /// → **Peer-process cwd discovery**.
     ///
     cwd_resolver: Arc<dyn CwdResolver>,
+    /// Editor binary used by the `openFile` tool. Defaults to
+    /// [`crate::zed_cli::DEFAULT_ZED_BIN`] (`"zed"` on `PATH`); tests
+    /// inject a fake script via [`TransportBuilder::with_zed_bin`].
+    zed_bin: String,
 }
 
 /// Builder for [`Transport`].
@@ -257,6 +261,7 @@ pub struct TransportBuilder {
     state: SharedEditorState,
     daemon_workspace: Option<PathBuf>,
     cwd_resolver: Arc<dyn CwdResolver>,
+    zed_bin: String,
 }
 
 impl TransportBuilder {
@@ -279,6 +284,13 @@ impl TransportBuilder {
         self
     }
 
+    /// Override the editor binary used by the `openFile` tool. Tests inject
+    /// a fake script here; production uses the default (`"zed"` on PATH).
+    pub fn with_zed_bin(mut self, bin: impl Into<String>) -> Self {
+        self.zed_bin = bin.into();
+        self
+    }
+
     /// Finalise the builder and construct a [`Transport`].
     pub fn build(self) -> Transport {
         let canonical_daemon_workspace =
@@ -289,6 +301,7 @@ impl TransportBuilder {
             registry: ClientRegistry::new(),
             daemon_workspace: canonical_daemon_workspace,
             cwd_resolver: self.cwd_resolver,
+            zed_bin: self.zed_bin,
         }
     }
 }
@@ -308,6 +321,7 @@ impl Transport {
             state,
             daemon_workspace: None,
             cwd_resolver: default_cwd_resolver(),
+            zed_bin: crate::zed_cli::DEFAULT_ZED_BIN.to_string(),
         }
     }
 
@@ -738,21 +752,21 @@ impl Transport {
                 }
             },
             McpResponse::NoReply => None,
-            // replaced in Task 5: the transport will execute openFile via
-            // zed_cli; until then answer with an internal error so clients
-            // get a well-formed JSON-RPC reply instead of silence.
-            McpResponse::OpenFile {
-                id: req_id,
-                args: _,
-            } => {
-                let resp = JsonRpcResponse::failure(
+            McpResponse::OpenFile { id: req_id, args } => {
+                // Relative paths resolve against the first workspace folder
+                // (VSCode parity), falling back to the daemon workspace.
+                // The state read-guard is scoped so it is dropped before
+                // the `.await` below (no lock held across await points).
+                let base = {
+                    let state_guard = self.state.read().await;
+                    state_guard.workspace_folders().first().cloned()
+                }
+                .or_else(|| self.daemon_workspace.clone());
+                let result = crate::zed_cli::open_file(&self.zed_bin, &args, base.as_deref()).await;
+                let resp = JsonRpcResponse::success(
                     req_id,
-                    JsonRpcError {
-                        code: error_code::INTERNAL_ERROR,
-                        message: "openFile execution is not wired into the transport yet"
-                            .to_string(),
-                        data: None,
-                    },
+                    serde_json::to_value(result)
+                        .unwrap_or_else(|_| serde_json::json!({"content": []})),
                 );
                 match serde_json::to_string(&resp) {
                     Ok(s) => Some(s),
