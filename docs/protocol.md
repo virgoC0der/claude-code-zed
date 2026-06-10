@@ -417,8 +417,12 @@ OpenSpec change.
 **Internal source: active-file watcher (Zed-sidecar extension).** In addition
 to IPC-frame-driven `selection_changed` notifications (from the `cmd-ctrl-c`
 task), the sidecar may emit `selection_changed` / refresh `getOpenEditors`
-from its Zed SQLite watcher (`src/zed_watch/`). These notifications carry an
-empty selection (`isEmpty: true`, no text) and convey only the active file
-path. They are routed directly to the single Claude session whose cwd matches
+from its Zed SQLite watcher (`src/zed_watch/`). These notifications carry
+the active editor's primary selection converted from Zed's persisted UTF-8
+byte offsets (`editor_selections`) to 0-indexed wire positions (UTF-16
+columns), including the selected text. When no selection row is persisted or
+the offsets are momentarily out of sync with the text basis, the
+notification degrades to an empty selection (file path only). They are
+routed directly to the single Claude session whose cwd matches
 the file's worktree — never broadcast. Upstream Claude Code sees a wire shape
 identical to §3.3.

@@ -256,7 +256,10 @@ MCP tools Claude already reads.
 
 - **Latency:** near-real-time (Zed flushes state to SQLite within ~1s; the
   watcher debounces ~400ms on top).
-- **Scope:** the active file only (not every open tab).
+- **Scope:** the active file plus your cursor/selection — the pushed
+  `selection_changed` carries the 0-indexed selection range AND the selected
+  text, so Claude knows which lines you're looking at without any keypress.
+  Dirty buffers use Zed's persisted unsaved contents as the conversion basis.
 - **Multi-session:** each Claude session is matched independently by its
   own cwd, so two sessions in different projects each see their own file.
 - **Disable:** pass `--no-watch-zed-db` to the sidecar.
