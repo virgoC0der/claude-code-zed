@@ -35,6 +35,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # and the sidecar agree on the IPC socket path. xxh3_64 is non-cryptographic;
 # any other algorithm would break compatibility.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# rusqlite (bundled SQLite) reads Zed's local workspace state DB read-only.
+# `bundled` pins a known SQLite version into the binary so we don't depend on
+# the host's libsqlite3 (avoids version-skew with Zed's own copy).
+rusqlite = { version = "0.40", features = ["bundled"] }
+# notify watches Zed's db.sqlite-wal for changes to trigger active-file refresh.
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"
