@@ -98,8 +98,10 @@ mod tests {
     #[test]
     fn probe_fails_when_table_missing() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE workspaces (session_id TEXT, paths TEXT, timestamp TEXT);")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (session_id TEXT, paths TEXT, timestamp TEXT);",
+        )
+        .unwrap();
         // items + editors absent -> PRAGMA returns no rows -> column missing.
         let err = probe(&conn).unwrap_err();
         assert!(matches!(err, ZedWatchError::SchemaMismatch(_)));
