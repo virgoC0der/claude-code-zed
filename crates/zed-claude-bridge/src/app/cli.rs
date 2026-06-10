@@ -72,6 +72,16 @@ pub struct DaemonArgs {
     /// `~/.claude/ide`. The directory is created with mode `0o700` if missing.
     #[arg(long, default_value = "~/.claude/ide", value_name = "DIR")]
     pub lock_dir: PathBuf,
+
+    /// Disable the Zed active-file watcher. The watcher is ON by default;
+    /// pass `--no-watch-zed-db` to turn it off.
+    #[arg(long = "no-watch-zed-db", default_value_t = false)]
+    pub no_watch_zed_db: bool,
+
+    /// Override the auto-detected path to Zed's `db.sqlite`. Mainly for tests
+    /// and non-standard installs.
+    #[arg(long, value_name = "PATH")]
+    pub zed_db_path: Option<PathBuf>,
 }
 
 /// Arguments for `ipc-send-at-mention`.

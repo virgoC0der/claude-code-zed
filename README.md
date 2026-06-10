@@ -240,6 +240,33 @@ sessions are connected and none can be uniquely identified). In
 practice every file you'd want to at-mention lives inside a worktree,
 so this is a soft edge case, not a footgun.
 
+### Active-file awareness (automatic)
+
+Beyond the explicit `cmd-ctrl-c` at-mention, the sidecar can keep Claude
+aware of *which file you're currently editing* — no keypress required,
+matching the JetBrains plugin's behaviour.
+
+This is on by default. The sidecar watches Zed's local SQLite state
+(`~/Library/Application Support/Zed/db/<channel>/db.sqlite`) and, whenever
+the active editor changes, resolves each connected Claude session's active
+file by matching the session's working directory to the open Zed worktree.
+The result flows into the same `getOpenEditors` / `getCurrentSelection`
+MCP tools Claude already reads.
+
+- **Latency:** near-real-time (Zed flushes state to SQLite within ~1s; the
+  watcher debounces ~400ms on top).
+- **Scope:** the active file only (not every open tab).
+- **Multi-session:** each Claude session is matched independently by its
+  own cwd, so two sessions in different projects each see their own file.
+- **Disable:** pass `--no-watch-zed-db` to the sidecar.
+- **Robustness:** if Zed's DB schema changes in a future version, the
+  watcher disables itself with a WARN and the rest of the sidecar
+  (at-mentions, `/ide` discovery) is unaffected.
+
+> This reads Zed's private SQLite schema, which is an implementation detail
+> rather than a public API. A schema probe at startup guards against Zed
+> version changes.
+
 ## Multiple Claude sessions
 
 The sidecar supports multiple concurrent `claude /ide` sessions
