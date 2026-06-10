@@ -114,7 +114,7 @@ From a `tool(...)` registration block in extension.js:
 | `getWorkspaceFolders` | `{}` | `{success, folders: [{name, uri, path, index}], rootPath, workspaceFile}` | **YES** |
 | `checkDocumentDirty` | `{filePath}` | `{success, isDirty}` | optional |
 | `saveDocument` | `{filePath}` | `{success}` | optional |
-| `openFile` | `{filePath, preview?, startText?, endText?, selectToEndOfLine?, makeFrontmost?}` | `{success, filePath, fileUrl, ...}` | optional |
+| `openFile` | `{filePath, preview?, startText?, endText?, selectToEndOfLine?, makeFrontmost?}` | `{success, filePath, fileUrl, ...}` | **YES** — positions the cursor only (`zed -e path:line:col`); selection-related args are accepted but ignored (Zed CLI limitation) |
 | `openDiff` | `{originalFilePath, newFilePath, edits, supportMultiEdits}` | diff UI events | NO (later) |
 | `close_tab` | `{...}` | tab close result | NO (later) |
 | `closeAllDiffTabs` | `{}` | result | NO (later) |

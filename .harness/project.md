@@ -50,13 +50,15 @@ Replicate Claude Code's IDE integration (VSCode/JetBrains-style) for the Zed edi
   1. `protocol/` — pure data types (no I/O), serde structs for JSON-RPC, lock file, IPC
   2. `lockfile/` — read/write `~/.claude/ide/<port>.lock` (depends on protocol)
   3. `mcp/` — MCP server logic: tools/list, tools/call dispatch (depends on protocol)
-  4. `transport/` — WebSocket accept loop + auth header check (depends on mcp, protocol)
-  5. `ipc/` — Unix-socket IPC server consumed by helper subcommands and the Zed task (depends on transport)
-  6. `app/` — wiring: CLI args, lifecycle, signal handling (depends on all)
-  7. `main.rs` — entrypoint only, no logic
+  4. `zed_cli/` — drive the Zed editor via its CLI (`zed -e`); the only module allowed to spawn editor processes (depends on protocol)
+  5. `transport/` — WebSocket accept loop + auth header check (depends on mcp, protocol)
+  6. `ipc/` — Unix-socket IPC server consumed by helper subcommands and the Zed task (depends on transport)
+  7. `app/` — wiring: CLI args, lifecycle, signal handling (depends on all)
+  8. `main.rs` — entrypoint only, no logic
 - placement_rules:
   - All wire types (JSON-RPC, lock-file JSON, IPC frames) live under `protocol/` with explicit `#[derive(Serialize, Deserialize)]`. No ad-hoc `serde_json::json!` outside this module.
   - I/O (sockets, files, env) MUST NOT appear in `protocol/` or `mcp/`.
+  - `tokio::process` spawning of the editor CLI lives only in `zed_cli/`.
   - `unsafe` is forbidden EXCEPT in `crates/zed-claude-bridge/src/transport/cwd_resolver.rs`, where narrow `unsafe` blocks are permitted at FFI / POD-union boundaries (macOS `libproc` integration). Each block MUST carry a `// SAFETY:` comment explaining the invariant. Hard limit: **2 blocks** — one for the `libc::proc_pidinfo` FFI call that reads a process's `proc_vnodepathinfo` (cwd), and one for the `libproc::libproc::net_info::SocketInfoProto` / `InSIAddr` union access needed to read a socket fd's local port. Add no other `unsafe` usage to the project. The exemption applies only to this file; the rest of the codebase remains `unsafe`-free per the layer rules.
   - Async runtime is **tokio**; no blocking calls inside async fns.
   - The WebSocket library is **tokio-tungstenite** (with `rustls` disabled — local plaintext only).
