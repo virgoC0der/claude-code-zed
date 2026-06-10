@@ -1,11 +1,24 @@
 # claude-code-zed
 
 A local sidecar binary plus a project-local Zed task that bring Claude
-Code's `/ide` integration to [Zed](https://zed.dev). When the sidecar is
-running for your Zed window, the Claude Code CLI's `/ide` command will
-discover Zed the same way it discovers VS Code or JetBrains, and a
-`cmd-ctrl-c` keybinding delivers `@<file>#L<m>-<n>` style at-mentions
-from the editor selection straight into the active Claude Code prompt.
+Code's `/ide` integration to [Zed](https://zed.dev) — feature parity
+with the official VS Code / JetBrains plugins, without a Zed extension:
+
+- **`/ide` discovery** — the Claude Code CLI finds Zed the same way it
+  finds VS Code or JetBrains (lock file + WebSocket MCP server). With a
+  fixed `--port`, `CLAUDE_CODE_SSE_PORT` auto-connects every `claude`
+  with no `/ide` at all.
+- **At-mentions** — a `cmd-ctrl-c` keybinding delivers
+  `@<file>#L<m>-<n>` from the editor selection straight into the active
+  Claude Code prompt, with session-aware routing when several sessions
+  are connected.
+- **Active-file & selection awareness (automatic)** — Claude knows
+  which file you're editing, where your cursor is, and what you have
+  selected (range + text), with zero keypresses: the sidecar watches
+  Zed's local state and pushes `selection_changed` per session.
+- **`openFile`** — Claude can jump your Zed to a file, positioned at a
+  text match (`zed -e path:line:col`), to show you exactly what it
+  means.
 
 The on-the-wire protocol is reverse-engineered from Anthropic's official
 VSCode extension (v2.1.76) and documented byte-for-byte in
@@ -18,14 +31,25 @@ the active change adding session-aware at-mention routing is at
 ## Status
 
 - **Sidecar binary** (`zed-claude-bridge`): functional. WebSocket MCP
-  server, lock-file discovery, IPC socket, signal-handled lifecycle,
-  selection debounce + dedup, an `ipc-send-at-mention` helper that
-  derives the line range from `$ZED_SELECTED_TEXT` (or falls back to
-  `$ZED_ROW`), and **session-aware at-mention routing** — multiple
-  concurrent `claude /ide` sessions are first-class. The sidecar
-  routes each at-mention to exactly one Claude session (no broadcast);
-  when two sessions share a workspace, a native macOS picker
-  disambiguates. See [*Multiple Claude sessions*](#multiple-claude-sessions) below.
+  server (five tools: `getCurrentSelection`, `getLatestSelection`,
+  `getOpenEditors`, `getWorkspaceFolders`, `openFile`), lock-file
+  discovery with optional fixed `--port`, IPC socket, signal-handled
+  lifecycle, selection debounce + dedup, an `ipc-send-at-mention`
+  helper that derives the line range from `$ZED_SELECTED_TEXT` (or
+  falls back to `$ZED_ROW`), and **session-aware at-mention routing**
+  — multiple concurrent `claude /ide` sessions are first-class. The
+  sidecar routes each at-mention to exactly one Claude session (no
+  broadcast); when two sessions share a workspace, a native macOS
+  picker disambiguates. See
+  [*Multiple Claude sessions*](#multiple-claude-sessions) below.
+- **Zed state watcher** (on by default): polls Zed's local SQLite
+  workspace state to resolve, per connected Claude session, the active
+  file and the primary cursor/selection (converted from Zed's UTF-8
+  byte offsets to wire positions, selected text included). Degrades
+  gracefully — a schema probe disables the watcher with a WARN if a
+  future Zed version changes its internal tables, leaving everything
+  else working. See
+  [*Active-file awareness*](#active-file-awareness-automatic) below.
 - **At-mention trigger**: a project-local Zed *task* (`.zed/tasks.json`)
   bound to `cmd-ctrl-c` (`.zed/keymap.json`). The task receives
   `$ZED_FILE`, `$ZED_ROW`, `$ZED_SELECTED_TEXT`, and
@@ -121,13 +145,16 @@ What happens at startup:
 
 CLI flags:
 
-| Flag           | Default            | What it does                                         |
-| -------------- | ------------------ | ---------------------------------------------------- |
-| `--workspace`  | *(required)*       | Workspace root; drives the IPC socket name           |
-| `--foreground` | `true`             | Run in the foreground (always true in this build)    |
-| `--log-level`  | `info`             | Tracing filter (also accepts full `EnvFilter` strings) |
-| `--ipc-socket` | derived            | Override the IPC socket path                         |
-| `--lock-dir`   | `~/.claude/ide`    | Override the lock-file directory                     |
+| Flag                | Default            | What it does                                         |
+| ------------------- | ------------------ | ---------------------------------------------------- |
+| `--workspace`       | *(required)*       | Workspace root; drives the IPC socket name           |
+| `--port`            | random             | Fixed WebSocket port (fail-fast if taken); enables `CLAUDE_CODE_SSE_PORT` auto-connect |
+| `--foreground`      | `true`             | Run in the foreground (always true in this build)    |
+| `--log-level`       | `info`             | Tracing filter (also accepts full `EnvFilter` strings) |
+| `--ipc-socket`      | derived            | Override the IPC socket path                         |
+| `--lock-dir`        | `~/.claude/ide`    | Override the lock-file directory                     |
+| `--no-watch-zed-db` | off (watcher on)   | Disable the Zed active-file/selection watcher        |
+| `--zed-db-path`     | auto-detected      | Override the path to Zed's `db.sqlite`               |
 
 Helper subcommands used by the Zed task (you usually don't run these by
 hand):
@@ -438,28 +465,24 @@ For a hands-on end-to-end check (requires `jq` and `websocat`):
 bash scripts/smoke.sh
 ```
 
-Test inventory (**185 tests** total at last count, all in the host
+Test inventory (**265 tests** total at last count, all in the host
 workspace):
 
-- 144 unit tests across `protocol`, `lockfile`, `mcp`, `transport`
-  (registry, router, ws), `ipc::server` (including the slow-client
-  backpressure tests), `app::cli` (line-range resolution and the
-  `--workspace-root` / `--client-id` parse tests), and `app::picker`
-  (AppleScript escape + macOS osascript stdout parsing).
-- 15 WebSocket integration tests in `tests/handshake.rs` (auth gate,
-  multi-client coexistence, registry-driven outbound, workspace
-  header capture, `clientInfo.cwd` priority-2 capture, daemon
-  `--workspace` priority-3 fallback).
-- 14 IPC integration tests in `tests/ipc.rs`.
-- 1 full-stack end-to-end test in `tests/end_to_end.rs` (IPC → sidecar →
-  WebSocket → MCP client, with at_mention 0 → 1-indexed conversion
-  verified on the wire).
-- 2 lock-file integration tests in `tests/lockfile.rs`.
-- 9 session-routing end-to-end tests in `tests/session_routing.rs`
-  (distinct-workspace routing, canonicalization symmetry, stale
-  client_id, legacy-helper disconnect, singleton fallback, no-match
-  drop with WARN, Ambiguous reply with two candidates, picker
-  follow-up routes to the picked client).
+- 210 unit tests across `protocol` (wire types incl. `OpenFileArgs`),
+  `lockfile`, `mcp` (five-tool list, deferred `openFile` dispatch),
+  `transport` (registry, router, ws, `bind_fixed`), `ipc::server`
+  (incl. slow-client backpressure), `zed_watch` (db locate, schema
+  probe, cwd→active-editor query incl. the BLOB-path regression
+  guard, byte-offset→position conversion incl. UTF-16 columns,
+  per-session dedup/repush), `zed_cli` (text location, fake-binary
+  spawn capture, error shapes), `app::cli`, and `app::picker`.
+- 55 integration tests under `tests/`: `handshake.rs` (15, auth gate
+  + multi-client + workspace identification), `ipc.rs` (14),
+  `session_routing.rs` (10), `peer_cwd_discovery.rs` (5),
+  `cwd_resolver_reexport.rs` (4), `zed_watch.rs` (3, on-disk DB →
+  selection offsets → wire positions), `lockfile.rs` (2),
+  `end_to_end.rs` (1, IPC → sidecar → WebSocket → MCP client),
+  `open_file.rs` (1, WS-level `openFile` with a fake `zed` binary).
 
 ## Specs
 
@@ -475,4 +498,4 @@ workspace):
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+Licensed under the [MIT License](LICENSE).
