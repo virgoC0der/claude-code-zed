@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + publish release
+    # macOS is required because peer-cwd-discovery uses libproc (target_os = "macos").
+    # An arm64 runner cross-compiles the x86_64 target with the same Xcode toolchain.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          target: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build release binaries (both targets)
+        run: |
+          cargo build --release -p zed-claude-bridge --target aarch64-apple-darwin
+          cargo build --release -p zed-claude-bridge --target x86_64-apple-darwin
+
+      - name: Package tarballs + checksums
+        run: |
+          mkdir -p dist
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            tar -czf "dist/zed-claude-bridge-${GITHUB_REF_NAME}-${target}.tar.gz" \
+              -C "target/${target}/release" zed-claude-bridge
+          done
+          (cd dist && shasum -a 256 ./*.tar.gz | tee checksums.txt)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
