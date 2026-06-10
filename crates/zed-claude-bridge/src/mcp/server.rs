@@ -7,6 +7,9 @@
 //!   client.
 //! - [`McpResponse::NoReply`] — the request was a notification (e.g.
 //!   `notifications/initialized`); send nothing.
+//! - [`McpResponse::OpenFile`] — `tools/call openFile` passed validation;
+//!   the I/O-capable caller (the transport layer) must execute it and build
+//!   the reply itself.
 //!
 //! No I/O, no async, no allocations beyond what serde requires.
 
@@ -15,8 +18,8 @@ use serde_json::{Value, json};
 use crate::mcp::state::EditorState;
 use crate::mcp::tools as mcp_tools;
 use crate::protocol::{
-    CallToolParams, Error as JsonRpcError, InitializeResult, Request, Response, ServerCapabilities,
-    ServerInfo, ToolsCapability, ToolsListResult, error_code,
+    CallToolParams, Error as JsonRpcError, InitializeResult, OpenFileArgs, Request, RequestId,
+    Response, ServerCapabilities, ServerInfo, ToolsCapability, ToolsListResult, error_code,
 };
 
 /// MCP protocol version this server speaks.
@@ -33,6 +36,15 @@ pub enum McpResponse {
     Reply(Response),
     /// The request was a notification; do not write anything to the wire.
     NoReply,
+    /// `tools/call openFile` passed pure validation; the I/O-capable caller
+    /// (the transport layer) must launch the editor via `zed_cli` and build
+    /// the reply itself. Keeps this module I/O-free per the layer rules.
+    OpenFile {
+        /// JSON-RPC id to answer with.
+        id: RequestId,
+        /// Validated tool arguments.
+        args: OpenFileArgs,
+    },
 }
 
 /// Dispatch a parsed JSON-RPC request against the editor state.
@@ -51,7 +63,7 @@ pub fn dispatch(state: &EditorState, req: Request) -> McpResponse {
         "notifications/initialized" => McpResponse::NoReply,
         "ping" => McpResponse::Reply(Response::success(req.id, json!({}))),
         "tools/list" => McpResponse::Reply(Response::success(req.id, tools_list_value())),
-        "tools/call" => McpResponse::Reply(handle_tools_call(state, req)),
+        "tools/call" => handle_tools_call(state, req),
         _ => McpResponse::Reply(Response::failure(
             req.id,
             JsonRpcError {
@@ -88,30 +100,30 @@ fn tools_list_value() -> Value {
     serde_json::to_value(result).unwrap_or_else(|_| json!({"tools": []}))
 }
 
-fn handle_tools_call(state: &EditorState, req: Request) -> Response {
+fn handle_tools_call(state: &EditorState, req: Request) -> McpResponse {
     let params: CallToolParams = match req.params.clone() {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
             Err(e) => {
-                return Response::failure(
+                return McpResponse::Reply(Response::failure(
                     req.id,
                     JsonRpcError {
                         code: error_code::INVALID_PARAMS,
                         message: format!("Invalid tools/call params: {e}"),
                         data: None,
                     },
-                );
+                ));
             }
         },
         None => {
-            return Response::failure(
+            return McpResponse::Reply(Response::failure(
                 req.id,
                 JsonRpcError {
                     code: error_code::INVALID_PARAMS,
                     message: "tools/call requires params".to_string(),
                     data: None,
                 },
-            );
+            ));
         }
     };
 
@@ -120,20 +132,41 @@ fn handle_tools_call(state: &EditorState, req: Request) -> Response {
         "getLatestSelection" => mcp_tools::tool_get_latest_selection(state),
         "getOpenEditors" => mcp_tools::tool_get_open_editors(state),
         "getWorkspaceFolders" => mcp_tools::tool_get_workspace_folders(state),
+        "openFile" => {
+            // `CallToolParams.arguments` defaults to `Value::Null` when the
+            // client omits it; substitute `{}` so the error message reports
+            // the missing `filePath` field rather than a type mismatch.
+            let args_value = if params.arguments.is_null() {
+                json!({})
+            } else {
+                params.arguments.clone()
+            };
+            return match serde_json::from_value::<OpenFileArgs>(args_value) {
+                Ok(args) => McpResponse::OpenFile { id: req.id, args },
+                Err(e) => McpResponse::Reply(Response::failure(
+                    req.id,
+                    JsonRpcError {
+                        code: error_code::INVALID_PARAMS,
+                        message: format!("Invalid openFile arguments: {e}"),
+                        data: None,
+                    },
+                )),
+            };
+        }
         other => {
-            return Response::failure(
+            return McpResponse::Reply(Response::failure(
                 req.id,
                 JsonRpcError {
                     code: error_code::INVALID_PARAMS,
                     message: format!("Unknown tool: {other}"),
                     data: None,
                 },
-            );
+            ));
         }
     };
 
     let value = serde_json::to_value(result).unwrap_or_else(|_| json!({"content":[]}));
-    Response::success(req.id, value)
+    McpResponse::Reply(Response::success(req.id, value))
 }
 
 #[cfg(test)]
@@ -171,6 +204,7 @@ mod tests {
         match resp {
             McpResponse::Reply(r) => r,
             McpResponse::NoReply => panic!("expected a Reply, got NoReply"),
+            McpResponse::OpenFile { .. } => panic!("expected a Reply, got OpenFile"),
         }
     }
 
@@ -233,17 +267,18 @@ mod tests {
     // ----- tools/list ----------------------------------------------------
 
     #[test]
-    fn tools_list_advertises_exactly_four_tools() {
+    fn tools_list_advertises_exactly_five_tools() {
         let state = EditorState::new();
         let resp = dispatch(&state, req(2, "tools/list", None));
         let v = ok_value(resp);
         let tools = v["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"getCurrentSelection"));
         assert!(names.contains(&"getLatestSelection"));
         assert!(names.contains(&"getOpenEditors"));
         assert!(names.contains(&"getWorkspaceFolders"));
+        assert!(names.contains(&"openFile"));
     }
 
     #[test]
@@ -259,7 +294,6 @@ mod tests {
             "executeCode",
             "close_tab",
             "closeAllDiffTabs",
-            "openFile",
             "checkDocumentDirty",
             "saveDocument",
         ] {
@@ -351,6 +385,44 @@ mod tests {
                 6,
                 "tools/call",
                 Some(json!({"name": "openDiff", "arguments": {}})),
+            ),
+        );
+        assert_eq!(err_code(resp), error_code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn tools_call_open_file_returns_deferred_variant() {
+        let state = EditorState::new();
+        let resp = dispatch(
+            &state,
+            req(
+                10,
+                "tools/call",
+                Some(
+                    json!({"name":"openFile","arguments":{"filePath":"/p/a.rs","startText":"fn main"}}),
+                ),
+            ),
+        );
+        match resp {
+            McpResponse::OpenFile { id, args } => {
+                assert_eq!(id, RequestId::Number(10));
+                assert_eq!(args.file_path, "/p/a.rs");
+                assert_eq!(args.start_text.as_deref(), Some("fn main"));
+                assert!(args.make_frontmost);
+            }
+            other => panic!("expected OpenFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tools_call_open_file_missing_file_path_is_invalid_params() {
+        let state = EditorState::new();
+        let resp = dispatch(
+            &state,
+            req(
+                11,
+                "tools/call",
+                Some(json!({"name":"openFile","arguments":{}})),
             ),
         );
         assert_eq!(err_code(resp), error_code::INVALID_PARAMS);

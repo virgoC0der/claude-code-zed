@@ -32,4 +32,4 @@ pub use registry::{
     CLIENT_CHANNEL_CAPACITY, ClientHandle, ClientHandleSnapshot, ClientId, ClientRegistry,
 };
 pub use router::{RoutingDecision, route_at_mention, route_selection_changed};
-pub use ws::{AuthToken, Transport, TransportBuilder, TransportError, bind_random};
+pub use ws::{AuthToken, Transport, TransportBuilder, TransportError, bind_fixed, bind_random};

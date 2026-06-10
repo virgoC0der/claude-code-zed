@@ -196,7 +196,7 @@ async fn full_mcp_handshake_initialize_then_tools_list() {
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["id"], 2, "next reply must correlate to tools/list (id=2)");
     let tools = v["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 5);
 
     // ping — empty result.
     ws.send(Message::Text(

@@ -26,7 +26,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{EditorState, McpResponse, dispatch};
-use crate::protocol::{Notification as JsonRpcNotification, Request as JsonRpcRequest, RequestId};
+use crate::protocol::{
+    Notification as JsonRpcNotification, Request as JsonRpcRequest, RequestId,
+    Response as JsonRpcResponse,
+};
 use crate::transport::cwd_resolver::{CwdResolver, default_cwd_resolver};
 use crate::transport::registry::{CLIENT_CHANNEL_CAPACITY, ClientHandle, ClientId, ClientRegistry};
 
@@ -157,6 +160,18 @@ pub async fn bind_random(max_retries: usize) -> Result<(TcpListener, u16), Trans
     })
 }
 
+/// Bind exactly `port` on IPv4 loopback. Unlike [`bind_random`], any bind
+/// failure (including `AddrInUse`) is returned immediately — a
+/// user-specified fixed port is explicit intent, so we fail fast rather
+/// than silently fall back to a random port.
+pub async fn bind_fixed(port: u16) -> Result<(TcpListener, u16), TransportError> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    match TcpListener::bind(addr).await {
+        Ok(listener) => Ok((listener, port)),
+        Err(e) => Err(TransportError::Io(e)),
+    }
+}
+
 fn random_port_in_range() -> u16 {
     // Use UUID v4's randomness rather than pulling in a new dep. We take 4
     // bytes to seed a u32 and modulo it into [MIN_PORT, MAX_PORT].
@@ -224,6 +239,10 @@ pub struct Transport {
     /// → **Peer-process cwd discovery**.
     ///
     cwd_resolver: Arc<dyn CwdResolver>,
+    /// Editor binary used by the `openFile` tool. Defaults to
+    /// [`crate::zed_cli::DEFAULT_ZED_BIN`] (`"zed"` on `PATH`); tests
+    /// inject a fake script via [`TransportBuilder::with_zed_bin`].
+    zed_bin: String,
 }
 
 /// Builder for [`Transport`].
@@ -242,6 +261,7 @@ pub struct TransportBuilder {
     state: SharedEditorState,
     daemon_workspace: Option<PathBuf>,
     cwd_resolver: Arc<dyn CwdResolver>,
+    zed_bin: String,
 }
 
 impl TransportBuilder {
@@ -264,6 +284,13 @@ impl TransportBuilder {
         self
     }
 
+    /// Override the editor binary used by the `openFile` tool. Tests inject
+    /// a fake script here; production uses the default (`"zed"` on PATH).
+    pub fn with_zed_bin(mut self, bin: impl Into<String>) -> Self {
+        self.zed_bin = bin.into();
+        self
+    }
+
     /// Finalise the builder and construct a [`Transport`].
     pub fn build(self) -> Transport {
         let canonical_daemon_workspace =
@@ -274,6 +301,7 @@ impl TransportBuilder {
             registry: ClientRegistry::new(),
             daemon_workspace: canonical_daemon_workspace,
             cwd_resolver: self.cwd_resolver,
+            zed_bin: self.zed_bin,
         }
     }
 }
@@ -293,6 +321,7 @@ impl Transport {
             state,
             daemon_workspace: None,
             cwd_resolver: default_cwd_resolver(),
+            zed_bin: crate::zed_cli::DEFAULT_ZED_BIN.to_string(),
         }
     }
 
@@ -723,6 +752,30 @@ impl Transport {
                 }
             },
             McpResponse::NoReply => None,
+            McpResponse::OpenFile { id: req_id, args } => {
+                // Relative paths resolve against the first workspace folder
+                // (VSCode parity), falling back to the daemon workspace.
+                // The state read-guard is scoped so it is dropped before
+                // the `.await` below (no lock held across await points).
+                let base = {
+                    let state_guard = self.state.read().await;
+                    state_guard.workspace_folders().first().cloned()
+                }
+                .or_else(|| self.daemon_workspace.clone());
+                let result = crate::zed_cli::open_file(&self.zed_bin, &args, base.as_deref()).await;
+                let resp = JsonRpcResponse::success(
+                    req_id,
+                    serde_json::to_value(result)
+                        .unwrap_or_else(|_| serde_json::json!({"content": []})),
+                );
+                match serde_json::to_string(&resp) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        error!(client_id = %id, error = %e, "failed to encode JSON-RPC response");
+                        None
+                    }
+                }
+            }
         }
     }
 }
@@ -828,6 +881,25 @@ mod tests {
         assert!(matches!(addr.ip(), IpAddr::V4(_)), "must be IPv4");
         assert_eq!(addr.port(), port);
         assert!((MIN_PORT..=MAX_PORT).contains(&port));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_fixed_binds_the_requested_port() {
+        // Grab a free port from the OS, release it, then bind it fixed.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (listener, got) = bind_fixed(port).await.expect("bind_fixed");
+        assert_eq!(got, port);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bind_fixed_fails_fast_when_port_taken() {
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let err = bind_fixed(port).await.expect_err("must fail while held");
+        assert!(matches!(err, TransportError::Io(_)));
     }
 
     /// Acceptance criterion for tasks.md §4.1: the new builder API

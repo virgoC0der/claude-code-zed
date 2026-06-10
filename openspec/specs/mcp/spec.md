@@ -40,25 +40,25 @@ The sidecar SHALL respond to a JSON-RPC `ping` request with `result = {}`.
 - **WHEN** the client sends `{"jsonrpc":"2.0","id":99,"method":"ping"}`
 - **THEN** the response SHALL equal `{"jsonrpc":"2.0","id":99,"result":{}}`
 
-### Requirement: tools/list advertises four tools
+### Requirement: tools/list advertises five tools
 
-The sidecar SHALL respond to `tools/list` with a list containing exactly four tool
+The sidecar SHALL respond to `tools/list` with a list containing exactly five tool
 descriptors with names `getCurrentSelection`, `getLatestSelection`, `getOpenEditors`,
-and `getWorkspaceFolders`. Each descriptor MUST include `name`, `description`, and
-`inputSchema` (a JSON Schema object).
+`getWorkspaceFolders`, and `openFile`. Each descriptor MUST include `name`,
+`description`, and `inputSchema` (a JSON Schema object).
 
-#### Scenario: tools/list contains the four read-only tools
+#### Scenario: tools/list contains the five in-scope tools
 
 - **WHEN** the client sends `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
-- **THEN** the response `result.tools` SHALL be an array of length 4
+- **THEN** the response `result.tools` SHALL be an array of length 5
 - **AND** the set of `result.tools[*].name` SHALL equal
-  `{"getCurrentSelection","getLatestSelection","getOpenEditors","getWorkspaceFolders"}`
+  `{"getCurrentSelection","getLatestSelection","getOpenEditors","getWorkspaceFolders","openFile"}`
 
 #### Scenario: out-of-scope tools are not advertised
 
 - **WHEN** the client inspects the `tools/list` response
 - **THEN** no tool with name `openDiff`, `getDiagnostics`, `executeCode`,
-  `close_tab`, `closeAllDiffTabs`, `openFile`, `checkDocumentDirty`, or
+  `close_tab`, `closeAllDiffTabs`, `checkDocumentDirty`, or
   `saveDocument` SHALL appear
 
 ### Requirement: getCurrentSelection returns the focused selection
@@ -133,9 +133,29 @@ does not have VSCode-style multi-root `.code-workspace` files).
 - **AND** `result.rootPath` SHALL equal `"/Users/me/proj"`
 - **AND** `result.workspaceFile` SHALL equal `null`
 
+### Requirement: openFile opens files via the zed CLI
+
+`tools/call` with `name = "openFile"` SHALL open the requested file in the Zed
+editor by spawning the `zed` CLI (`zed -e <path>:<line>:<col>`), positioning the
+cursor at the first match of `startText` when provided. Selection-related
+arguments (`endText`, `selectToEndOfLine`, `makeFrontmost: false`, `preview`)
+SHALL be accepted without error and ignored — the Zed CLI cannot create a
+selection or open files in the background.
+
+#### Scenario: openFile positions the editor via the zed CLI
+
+- **GIVEN** a connected MCP client and a file `/w/src/main.rs` containing `fn main`
+- **WHEN** the client calls `tools/call` `openFile` with
+  `{"filePath": "/w/src/main.rs", "startText": "fn main"}`
+- **THEN** the sidecar spawns `zed -e /w/src/main.rs:<line>:<col>` with the
+  located 1-indexed position
+- **AND** the reply's text content is `Opened file and positioned at "fn main"`
+- **AND** selection-related arguments (`endText`, `selectToEndOfLine`,
+  `makeFrontmost:false`, `preview`) are accepted without error and ignored
+
 ### Requirement: Unknown tool returns -32602
 
-`tools/call` with a `name` that is not one of the four advertised tools SHALL return
+`tools/call` with a `name` that is not one of the five advertised tools SHALL return
 a JSON-RPC error with `code = -32602` (Invalid params).
 
 #### Scenario: Unknown tool name

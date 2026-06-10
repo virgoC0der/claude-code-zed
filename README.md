@@ -173,9 +173,10 @@ Two flags drive session-aware routing (see
    type `/ide`. The CLI will scan `~/.claude/ide/*.lock`, connect to your
    sidecar's WebSocket, and complete the MCP handshake. You should see
    "Zed" listed as a connected IDE.
-3. The four read-only MCP tools become available:
+3. Five MCP tools become available: the read-only
    `getCurrentSelection`, `getLatestSelection`, `getOpenEditors`,
-   `getWorkspaceFolders`.
+   `getWorkspaceFolders`, plus `openFile` (see
+   [*Let Claude open files in your Zed*](#let-claude-open-files-in-your-zed-openfile)).
 
 ## Usage: send a selection from Zed to Claude Code
 
@@ -269,6 +270,37 @@ MCP tools Claude already reads.
 > This reads Zed's private SQLite schema, which is an implementation detail
 > rather than a public API. A schema probe at startup guards against Zed
 > version changes.
+
+### Let Claude open files in your Zed (openFile)
+
+The sidecar advertises the `openFile` MCP tool. When Claude wants to show
+you code, it can jump your Zed window straight to the file — positioned at
+a text match — via `zed -e <path>:<line>:<col>`.
+
+Capability note: the Zed CLI can position the cursor but cannot create a
+selection or open files in the background, so `startText` positions the
+cursor at the match and `endText` / `selectToEndOfLine` /
+`makeFrontmost:false` / `preview` are accepted (for protocol compatibility)
+but ignored. Requires the `zed` CLI on `PATH` (Zed: "Install CLI").
+
+### Auto-connect from any terminal (stable port)
+
+Pass `--port <N>` to pin the sidecar's WebSocket port (the LaunchAgent
+template pins `52840`). With a fixed port, set:
+
+```bash
+export CLAUDE_CODE_SSE_PORT=52840   # shell rc: every `claude` auto-connects
+```
+
+or per-project for Zed's built-in terminal (`.zed/settings.json`):
+
+```json
+{ "terminal": { "env": { "CLAUDE_CODE_SSE_PORT": "52840" } } }
+```
+
+`claude` then connects to the sidecar on startup — no `/ide` needed. If the
+fixed port is taken at startup the sidecar exits with a clear error rather
+than silently moving (check the log; pick another port).
 
 ## Multiple Claude sessions
 
