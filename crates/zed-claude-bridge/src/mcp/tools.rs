@@ -1,5 +1,5 @@
-//! The four read-only MCP tools the IDE bridge exposes, plus their
-//! advertised descriptors.
+//! The MCP tools the IDE bridge exposes (four read-only tools plus
+//! `openFile`), and their advertised descriptors.
 //!
 //! Out-of-scope tools (`openDiff`, `getDiagnostics`, `executeCode`, …) are
 //! deliberately not advertised here — see `docs/protocol.md` §3.2 first-cut
@@ -16,12 +16,13 @@ use serde_json::{Value, json};
 use crate::mcp::state::EditorState;
 use crate::protocol::{CallToolResult, Tool, ToolContent};
 
-/// Names of the four read-only tools, in the order they are advertised.
+/// Names of the advertised tools, in the order they are advertised.
 pub const TOOL_NAMES: &[&str] = &[
     "getCurrentSelection",
     "getLatestSelection",
     "getOpenEditors",
     "getWorkspaceFolders",
+    "openFile",
 ];
 
 /// Static descriptors for [`TOOL_NAMES`]. Built once on first access.
@@ -60,6 +61,25 @@ pub fn tools_list() -> Vec<Tool> {
                 "Returns the workspace folders currently open in the IDE.".to_string(),
             ),
             input_schema: empty_object_schema,
+        },
+        Tool {
+            name: "openFile".to_string(),
+            description: Some(
+                "Open a file in the editor, optionally jumping to the position of a text pattern.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filePath": { "type": "string", "description": "Path to the file to open" },
+                    "preview": { "type": "boolean", "default": false },
+                    "startText": { "type": "string", "description": "Text pattern; the cursor is positioned at its first occurrence" },
+                    "endText": { "type": "string", "description": "Accepted for compatibility; Zed cannot set selections" },
+                    "selectToEndOfLine": { "type": "boolean", "default": false },
+                    "makeFrontmost": { "type": "boolean", "default": true }
+                },
+                "required": ["filePath"],
+                "additionalProperties": false
+            }),
         },
     ]
 }
@@ -197,7 +217,7 @@ mod tests {
     // ----- tools_list ----------------------------------------------------
 
     #[test]
-    fn tools_list_advertises_exactly_the_four_tools() {
+    fn tools_list_advertises_exactly_the_five_tools() {
         let list = tools_list();
         let names: Vec<&str> = list.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
@@ -207,6 +227,7 @@ mod tests {
                 "getLatestSelection",
                 "getOpenEditors",
                 "getWorkspaceFolders",
+                "openFile",
             ]
         );
     }
@@ -220,7 +241,6 @@ mod tests {
             "executeCode",
             "close_tab",
             "closeAllDiffTabs",
-            "openFile",
             "checkDocumentDirty",
             "saveDocument",
         ] {

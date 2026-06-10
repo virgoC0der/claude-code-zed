@@ -26,7 +26,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{EditorState, McpResponse, dispatch};
-use crate::protocol::{Notification as JsonRpcNotification, Request as JsonRpcRequest, RequestId};
+use crate::protocol::{
+    Error as JsonRpcError, Notification as JsonRpcNotification, Request as JsonRpcRequest,
+    RequestId, Response as JsonRpcResponse, error_code,
+};
 use crate::transport::cwd_resolver::{CwdResolver, default_cwd_resolver};
 use crate::transport::registry::{CLIENT_CHANNEL_CAPACITY, ClientHandle, ClientId, ClientRegistry};
 
@@ -735,6 +738,30 @@ impl Transport {
                 }
             },
             McpResponse::NoReply => None,
+            // replaced in Task 5: the transport will execute openFile via
+            // zed_cli; until then answer with an internal error so clients
+            // get a well-formed JSON-RPC reply instead of silence.
+            McpResponse::OpenFile {
+                id: req_id,
+                args: _,
+            } => {
+                let resp = JsonRpcResponse::failure(
+                    req_id,
+                    JsonRpcError {
+                        code: error_code::INTERNAL_ERROR,
+                        message: "openFile execution is not wired into the transport yet"
+                            .to_string(),
+                        data: None,
+                    },
+                );
+                match serde_json::to_string(&resp) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        error!(client_id = %id, error = %e, "failed to encode JSON-RPC response");
+                        None
+                    }
+                }
+            }
         }
     }
 }
