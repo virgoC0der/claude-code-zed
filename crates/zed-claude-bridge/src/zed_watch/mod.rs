@@ -11,6 +11,9 @@
 pub mod db_path;
 pub mod query;
 pub mod schema_probe;
+pub mod watcher;
+
+pub use watcher::run;
 
 use std::path::PathBuf;
 
