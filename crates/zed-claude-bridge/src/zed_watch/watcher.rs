@@ -28,9 +28,50 @@ const POLL_FALLBACK: Duration = Duration::from_secs(2);
 /// Per-client outbound send timeout (mirrors ipc::server's policy).
 const SEND_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// Build the `OpenEditor` + empty `StoredSelection` representing `file` as the
-/// active editor. The selection is empty (we only convey the file path; MVP).
-pub fn build_active_editor(file: &Path) -> (OpenEditor, StoredSelection) {
+/// 0-indexed wire position of UTF-8 byte offset `off` in `basis`.
+/// `character` counts UTF-16 code units from the line start (VSCode
+/// semantics, protocol.md §3.3). Caller guarantees `off <= basis.len()`.
+fn position_at(basis: &str, off: usize) -> Position {
+    let bytes = basis.as_bytes();
+    let before = &bytes[..off];
+    let line = before.iter().filter(|b| **b == b'\n').count() as u32;
+    let line_start = before
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let col_text = String::from_utf8_lossy(&bytes[line_start..off]);
+    let character = col_text.encode_utf16().count() as u32;
+    Position { line, character }
+}
+
+/// Convert a `(start, end)` UTF-8 byte-offset range into a wire `Selection`
+/// plus the selected text. Returns `None` when the range is out of bounds or
+/// inverted (e.g. the DB and the text basis are momentarily out of sync) —
+/// callers degrade to the v1 empty selection.
+pub fn selection_from_offsets(basis: &str, start: u64, end: u64) -> Option<(Selection, String)> {
+    let (s, e) = (start as usize, end as usize);
+    if s > e || e > basis.len() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&basis.as_bytes()[s..e]).to_string();
+    Some((
+        Selection {
+            start: position_at(basis, s),
+            end: position_at(basis, e),
+            is_empty: s == e,
+        },
+        text,
+    ))
+}
+
+/// Build the `OpenEditor` + `StoredSelection` for `file`. When `selection`
+/// carries a converted range + text, the stored selection is real; otherwise
+/// it falls back to the v1 empty placeholder (file path only).
+pub fn build_active_editor(
+    file: &Path,
+    selection: Option<(Selection, String)>,
+) -> (OpenEditor, StoredSelection) {
     let path_str = file.to_string_lossy().to_string();
     let url = format!("file://{path_str}");
     let language_id = file
@@ -46,11 +87,8 @@ pub fn build_active_editor(file: &Path) -> (OpenEditor, StoredSelection) {
         is_dirty: None,
         language_id,
     };
-    let selection = StoredSelection {
-        text: String::new(),
-        file_path: path_str,
-        file_url: url,
-        selection: Selection {
+    let (sel, text) = selection.unwrap_or((
+        Selection {
             start: Position {
                 line: 0,
                 character: 0,
@@ -61,8 +99,15 @@ pub fn build_active_editor(file: &Path) -> (OpenEditor, StoredSelection) {
             },
             is_empty: true,
         },
+        String::new(),
+    ));
+    let stored = StoredSelection {
+        text,
+        file_path: path_str.clone(),
+        file_url: url.clone(),
+        selection: sel,
     };
-    (editor, selection)
+    (editor, stored)
 }
 
 /// Map a file extension to a best-effort MCP `languageId`. Unknown extensions
@@ -85,10 +130,11 @@ fn language_for_extension(ext: &str) -> String {
     .to_string()
 }
 
-/// Tracks the last active file pushed per client, so we only push on change.
+/// Tracks the last selection pushed per client, so we only push on change —
+/// a re-push happens when the file OR the selection within it changes.
 #[derive(Default)]
 struct PushState {
-    last: HashMap<ClientId, PathBuf>,
+    last: HashMap<ClientId, StoredSelection>,
 }
 
 /// Run one refresh cycle: for each connected client with a usable cwd, query
@@ -121,21 +167,33 @@ async fn refresh_once(
             debug!(client_id = %client.id, "client cwd equals daemon workspace; skipping active-file push");
             continue;
         }
-        let active = match query::active_file_for_cwd(conn, cwd) {
-            Ok(Some(p)) => p,
+        let editor = match query::active_editor_for_cwd(conn, cwd) {
+            Ok(Some(e)) => e,
             Ok(None) => continue,
             Err(e) => {
-                warn!(error = %e, client_id = %client.id, "active-file query failed; skipping this client");
+                warn!(error = %e, client_id = %client.id, "active-editor query failed; skipping this client");
                 continue;
             }
         };
-        // Dedup: only push when this client's active file changed.
-        if push_state.last.get(&client.id) == Some(&active) {
+        let active = editor.path.clone();
+        // Selection basis: dirty-buffer contents first, else the on-disk file.
+        let converted = match editor.selection {
+            Some((s, e)) => {
+                let basis = match &editor.unsaved_contents {
+                    Some(c) => Some(c.clone()),
+                    None => tokio::fs::read_to_string(&active).await.ok(),
+                };
+                basis.and_then(|b| selection_from_offsets(&b, s, e))
+            }
+            None => None,
+        };
+
+        let (editor, selection) = build_active_editor(&active, converted);
+        // Dedup: only push when this client's file or selection changed.
+        if push_state.last.get(&client.id) == Some(&selection) {
             continue;
         }
-        push_state.last.insert(client.id, active.clone());
-
-        let (editor, selection) = build_active_editor(&active);
+        push_state.last.insert(client.id, selection.clone());
         {
             let mut s = state.write().await;
             s.set_open_editors(vec![editor]);
@@ -270,7 +328,7 @@ mod tests {
 
     #[test]
     fn build_active_editor_sets_active_and_empty_selection() {
-        let (editor, sel) = build_active_editor(Path::new("/p/main.rs"));
+        let (editor, sel) = build_active_editor(Path::new("/p/main.rs"), None);
         assert_eq!(editor.uri, "file:///p/main.rs");
         assert!(editor.is_active);
         assert_eq!(editor.language_id.as_deref(), Some("rust"));
@@ -282,8 +340,61 @@ mod tests {
 
     #[test]
     fn unknown_extension_falls_back_to_extension() {
-        let (editor, _) = build_active_editor(Path::new("/p/x.zig"));
+        let (editor, _) = build_active_editor(Path::new("/p/x.zig"), None);
         assert_eq!(editor.language_id.as_deref(), Some("zig"));
+    }
+
+    // ----- position_at / selection_from_offsets ----------------------------
+
+    #[test]
+    fn position_at_ascii() {
+        let basis = "fn a() {}\nfn main() {}\n";
+        // offset 10 = start of line 2 (0-indexed line 1, char 0)
+        let p = position_at(basis, 10);
+        assert_eq!((p.line, p.character), (1, 0));
+        // offset 13 = "main" start: line 1, char 3
+        let p = position_at(basis, 13);
+        assert_eq!((p.line, p.character), (1, 3));
+    }
+
+    #[test]
+    fn position_at_multibyte_utf16_columns() {
+        // '→' is 3 UTF-8 bytes / 1 UTF-16 unit; '你' is 3 bytes / 1 unit.
+        let basis = "a→b你c\nx";
+        // byte offset of 'c' = 1 + 3 + 1 + 3 = 8; utf16 col = 4
+        let p = position_at(basis, 8);
+        assert_eq!((p.line, p.character), (0, 4));
+        // byte offset of 'x' = 10 (after \n at 9): line 1 char 0
+        let p = position_at(basis, 10);
+        assert_eq!((p.line, p.character), (1, 0));
+    }
+
+    #[test]
+    fn selection_from_offsets_extracts_text_and_flags() {
+        let basis = "hello\nworld\n";
+        let (sel, text) = selection_from_offsets(basis, 6, 11).expect("in range");
+        assert_eq!(text, "world");
+        assert!(!sel.is_empty);
+        assert_eq!((sel.start.line, sel.start.character), (1, 0));
+        assert_eq!((sel.end.line, sel.end.character), (1, 5));
+    }
+
+    #[test]
+    fn selection_from_offsets_cursor_is_empty() {
+        let (sel, text) = selection_from_offsets("abc", 1, 1).expect("in range");
+        assert!(sel.is_empty);
+        assert_eq!(text, "");
+        assert_eq!((sel.start.line, sel.start.character), (0, 1));
+    }
+
+    #[test]
+    fn selection_from_offsets_out_of_range_degrades_to_none() {
+        assert!(selection_from_offsets("abc", 0, 99).is_none());
+        assert!(selection_from_offsets("abc", 99, 99).is_none());
+        assert!(
+            selection_from_offsets("abc", 2, 1).is_none(),
+            "inverted range"
+        );
     }
 
     use crate::transport::registry::{CLIENT_CHANNEL_CAPACITY, ClientHandle};
@@ -360,6 +471,75 @@ mod tests {
         // Second cycle with no DB change -> no new push.
         refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
         assert!(rx.try_recv().is_err(), "no second push for unchanged file");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_pushes_real_selection_from_db() {
+        let mut conn = seed_db();
+        // Selection over bytes 4..9 of the on-disk basis — write a real file
+        // so the disk fallback basis exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("main.rs");
+        std::fs::write(&file, "abc\ndefgh\n").unwrap();
+        let file_str = file.to_str().unwrap();
+        conn.execute(
+            "UPDATE editors SET path = CAST(?1 AS BLOB) WHERE item_id = 1",
+            rusqlite::params![file_str],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editor_selections (item_id, editor_id, workspace_id, start, \"end\")
+             VALUES (1, 1, 1, 4, 9)",
+            [],
+        )
+        .unwrap();
+
+        let reg = ClientRegistry::new();
+        let (_id, mut rx) = register(&reg, "/proj").await;
+        let state = Arc::new(RwLock::new(EditorState::new()));
+        let mut ps = PushState::default();
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+
+        let notif = rx.try_recv().expect("selection_changed queued");
+        let params = notif.params.expect("params");
+        assert_eq!(params["text"], "defgh");
+        assert_eq!(params["selection"]["start"]["line"], 1);
+        assert_eq!(params["selection"]["start"]["character"], 0);
+        assert_eq!(params["selection"]["end"]["character"], 5);
+        assert_eq!(params["selection"]["isEmpty"], false);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_repushes_when_only_selection_changes() {
+        // Same file, selection moves → dedup must NOT swallow the second push.
+        let mut conn = seed_db();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("main.rs");
+        std::fs::write(&file, "abc\ndefgh\n").unwrap();
+        conn.execute(
+            "UPDATE editors SET path = CAST(?1 AS BLOB) WHERE item_id = 1",
+            rusqlite::params![file.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editor_selections (item_id, editor_id, workspace_id, start, \"end\")
+             VALUES (1, 1, 1, 0, 3)",
+            [],
+        )
+        .unwrap();
+
+        let reg = ClientRegistry::new();
+        let (_id, mut rx) = register(&reg, "/proj").await;
+        let state = Arc::new(RwLock::new(EditorState::new()));
+        let mut ps = PushState::default();
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+        assert!(rx.try_recv().is_ok(), "first push");
+
+        conn.execute("UPDATE editor_selections SET start = 4, \"end\" = 9", [])
+            .unwrap();
+        refresh_once(&mut conn, &reg, &state, Path::new("/daemon-ws"), &mut ps).await;
+        let second = rx.try_recv().expect("selection move must re-push");
+        assert_eq!(second.params.unwrap()["text"], "defgh");
     }
 
     #[tokio::test(flavor = "current_thread")]
