@@ -9,6 +9,7 @@
 //! macOS only this iteration. `db_path` documents the Linux extension point.
 
 pub mod db_path;
+pub mod schema_probe;
 
 use std::path::PathBuf;
 
