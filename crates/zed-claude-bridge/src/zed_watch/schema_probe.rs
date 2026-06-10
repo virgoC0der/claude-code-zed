@@ -21,6 +21,10 @@ const REQUIRED: &[(&str, &str)] = &[
     ("editors", "path"),
     ("editors", "item_id"),
     ("editors", "workspace_id"),
+    ("editor_selections", "editor_id"),
+    ("editor_selections", "workspace_id"),
+    ("editor_selections", "start"),
+    ("editor_selections", "end"),
 ];
 
 /// Confirm every (table, column) in [`REQUIRED`] exists. Returns
@@ -69,6 +73,10 @@ mod tests {
              );
              CREATE TABLE editors (
                  item_id INTEGER, workspace_id INTEGER, path BLOB
+             );
+             CREATE TABLE editor_selections (
+                 item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
+                 start INTEGER, \"end\" INTEGER
              );",
         )
         .unwrap();

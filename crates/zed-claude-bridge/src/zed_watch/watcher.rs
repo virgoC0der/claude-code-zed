@@ -296,10 +296,14 @@ mod tests {
             "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
                  timestamp TEXT, session_id TEXT);
              CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
-             CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB);
+             CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB, contents BLOB);
+             CREATE TABLE editor_selections (
+                 item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
+                 start INTEGER, \"end\" INTEGER
+             );
              INSERT INTO workspaces VALUES (1, '/proj', '2026-06-09 01:00:00', 'S');
              INSERT INTO items VALUES (1, 1, 'Editor', 1);
-             INSERT INTO editors VALUES (1, 1, CAST('/proj/main.rs' AS BLOB));",
+             INSERT INTO editors VALUES (1, 1, CAST('/proj/main.rs' AS BLOB), NULL);",
         )
         .unwrap();
         conn
