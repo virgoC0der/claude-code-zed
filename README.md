@@ -123,13 +123,37 @@ why.
 
 ## Run the sidecar
 
-You have two options:
+### Homebrew services (recommended)
 
-### Option A: launch on macOS login (recommended)
+If you installed via Homebrew, run the sidecar as a login service:
 
-Install the bundled LaunchAgent. It runs a single sidecar pinned to your
-home directory (`--workspace "$HOME"`), which Claude Code's `/ide` will
-match against any project under `~/`:
+```bash
+brew services start zed-claude-bridge
+```
+
+This runs a single sidecar pinned to your home directory
+(`--workspace "$HOME"`) on the fixed port `52840`, which Claude Code's
+`/ide` will match against any project under `~/`. The fixed port also
+lets `CLAUDE_CODE_SSE_PORT=52840` auto-connect every `claude` with no
+`/ide` (see [*Auto-connect from any terminal*](#auto-connect-from-any-terminal-stable-port)).
+`brew services` manages the launchd agent and restarts for you. Logs
+land in `/opt/homebrew/var/log/zed-claude-bridge.log` (i.e.
+`$(brew --prefix)/var/log/zed-claude-bridge.log`).
+
+Stop or restart with `brew services stop` / `brew services restart
+zed-claude-bridge`.
+
+### Without Homebrew
+
+If you didn't install via Homebrew (e.g. you built from source), you have
+two alternatives.
+
+<details>
+<summary><strong>Manual LaunchAgent (login service)</strong></summary>
+
+Install the bundled LaunchAgent. Like the Homebrew service, it runs a
+single sidecar pinned to your home directory (`--workspace "$HOME"`),
+matched by `/ide` against any project under `~/`:
 
 ```bash
 cargo install --path crates/zed-claude-bridge      # ensure binary on PATH
@@ -140,7 +164,10 @@ chmod 700 ~/.claude/ide                            # one-time, sidecar requires 
 Logs at `~/Library/Logs/zed-claude-bridge.log`. Uninstall with
 `./scripts/uninstall-launchd.sh`.
 
-### Option B: run by hand
+</details>
+
+<details>
+<summary><strong>Foreground, one sidecar per project</strong></summary>
 
 Per-window manual launch, useful when you want one sidecar per project:
 
@@ -150,6 +177,8 @@ cargo run -p zed-claude-bridge -- --workspace /path/to/your/project
 
 If you go this route, edit `.zed/tasks.json` so `--workspace` is
 `$ZED_WORKTREE_ROOT` (the original behaviour) instead of `$HOME`.
+
+</details>
 
 What happens at startup:
 
@@ -355,9 +384,10 @@ than silently moving (check the log; pick another port).
 ## Multiple Claude sessions
 
 The sidecar supports multiple concurrent `claude /ide` sessions
-against the same WebSocket server. This matters for the LaunchAgent
-deployment (one sidecar at `$HOME` serving every project under it),
-and for users who run two `claude /ide` terminals against the same
+against the same WebSocket server. This matters for the login-service
+deployment (one sidecar at `$HOME` serving every project under it —
+whether started by `brew services` or the manual LaunchAgent), and
+for users who run two `claude /ide` terminals against the same
 project. Each at-mention goes to **exactly one** Claude session, not
 all of them — the prior single-client / displacement policy is
 removed.
@@ -415,14 +445,15 @@ both the WebSocket side and the IPC frame side, so symlinks (e.g.
 macOS's `/var → /private/var`) don't cause silent routing
 mismatches.
 
-### LaunchAgent interaction
+### Login-service interaction
 
-The LaunchAgent option (single sidecar pinned to `$HOME`) is the
-primary beneficiary of session-aware routing. Before this change,
-one sidecar at `$HOME` worked for one session at a time; now it
-serves every Claude session under `~/` simultaneously, with each
-at-mention routed to the right session via the rules above. No
-configuration change beyond installing the agent is required.
+The login-service option (single sidecar pinned to `$HOME`, started
+by `brew services` or the manual LaunchAgent) is the primary
+beneficiary of session-aware routing. Before this change, one sidecar
+at `$HOME` worked for one session at a time; now it serves every
+Claude session under `~/` simultaneously, with each at-mention routed
+to the right session via the rules above. No configuration change
+beyond starting the service is required.
 
 ### Troubleshooting: my at-mention went nowhere
 
@@ -430,8 +461,9 @@ If pressing `cmd-ctrl-c` produced no at-mention in any Claude
 session, tail the sidecar log:
 
 ```bash
-tail -f ~/Library/Logs/zed-claude-bridge.log     # LaunchAgent option A
-# or check stderr for the foreground sidecar (Option B)
+tail -f /opt/homebrew/var/log/zed-claude-bridge.log   # brew services (recommended)
+# or: tail -f ~/Library/Logs/zed-claude-bridge.log    # manual LaunchAgent
+# or: check stderr for a foreground sidecar
 ```
 
 You'll see one of these WARN patterns:
