@@ -39,8 +39,8 @@ pub struct ActiveEditor {
     /// `(start, end)` UTF-8 byte offsets from `editor_selections`; `None`
     /// when no selection row is persisted (v1 empty-selection behaviour).
     pub selection: Option<(u64, u64)>,
-    /// `editors.contents` (BLOB, lossy UTF-8) when non-NULL — the text basis
-    /// for offset conversion on dirty buffers.
+    /// `editors.contents` (TEXT) when non-NULL — the text basis for offset
+    /// conversion on dirty buffers.
     pub unsaved_contents: Option<String>,
 }
 
@@ -72,12 +72,15 @@ pub fn active_editor_for_cwd(
     )?;
     let rows = stmt.query_map([&session], |row| {
         let paths: Option<String> = row.get(0)?;
-        // editors.path / editors.contents are BLOBs; read as bytes and decode
-        // lossily. A TEXT-literal SQL comparison would silently match nothing.
+        // editors.path is a BLOB: read as bytes and decode lossily (a
+        // TEXT-literal SQL comparison would silently match nothing).
         let active: Vec<u8> = row.get(1)?;
         let start: Option<i64> = row.get(2)?;
         let end: Option<i64> = row.get(3)?;
-        let contents: Option<Vec<u8>> = row.get(4)?;
+        // editors.contents is declared TEXT in Zed's STRICT schema, so a
+        // non-NULL value is always stored as text; reading it as Vec<u8>
+        // raised `Invalid column type Text`.
+        let contents: Option<String> = row.get(4)?;
         Ok((paths, active, start, end, contents))
     })?;
 
@@ -93,7 +96,7 @@ pub fn active_editor_for_cwd(
                 (Some(s), Some(e)) if s >= 0 && e >= 0 => Some((s as u64, e as u64)),
                 _ => None,
             };
-            let unsaved_contents = contents.map(|c| String::from_utf8_lossy(&c).to_string());
+            let unsaved_contents = contents;
             return Ok(Some(ActiveEditor {
                 path: PathBuf::from(active),
                 selection,
@@ -134,7 +137,7 @@ mod tests {
             "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
                  timestamp TEXT, session_id TEXT);
              CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
-             CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB, contents BLOB);
+             CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB, contents TEXT);
              CREATE TABLE editor_selections (
                  item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
                  start INTEGER, \"end\" INTEGER
@@ -267,10 +270,12 @@ mod tests {
     }
 
     #[test]
-    fn active_editor_reads_blob_contents_as_unsaved_text() {
+    fn active_editor_reads_text_contents_as_unsaved_text() {
+        // editors.contents is TEXT in Zed's real schema (see the STRICT-table
+        // regression below); store it as text, not BLOB.
         let conn = db_with(&[(1, "S", "/p", "/p/main.rs")]);
         conn.execute(
-            "UPDATE editors SET contents = CAST('dirty buffer text' AS BLOB) WHERE item_id = 1",
+            "UPDATE editors SET contents = 'dirty buffer text' WHERE item_id = 1",
             [],
         )
         .unwrap();
@@ -308,5 +313,67 @@ mod tests {
             active_file_for_cwd(&conn, Path::new("/p")).unwrap(),
             Some(PathBuf::from("/p/main.rs"))
         );
+    }
+
+    /// Regression for the live STRICT schema: real Zed declares
+    /// `editors.contents TEXT` in a `STRICT` table, so the stored value is
+    /// always `text`, never `blob`. Reading it as `Vec<u8>` raised
+    /// `Invalid column type Text at index: 4, name: contents`, which failed
+    /// the query for every client on every poll. `path` stays BLOB.
+    #[test]
+    fn text_contents_in_strict_table_is_read_as_unsaved_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
+                 timestamp TEXT, session_id TEXT);
+             CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
+             CREATE TABLE editors (
+                 item_id INTEGER NOT NULL, workspace_id INTEGER NOT NULL,
+                 path BLOB, contents TEXT
+             ) STRICT;
+             CREATE TABLE editor_selections (
+                 item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
+                 start INTEGER, \"end\" INTEGER
+             );
+             INSERT INTO workspaces VALUES (1, '/p', '2026-06-09 01:00:00', 'S');
+             INSERT INTO items VALUES (1, 1, 'Editor', 1);
+             INSERT INTO editors (item_id, workspace_id, path, contents)
+                 VALUES (1, 1, CAST('/p/main.rs' AS BLOB), 'dirty buffer text');",
+        )
+        .unwrap();
+        let e = active_editor_for_cwd(&conn, Path::new("/p"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.path, PathBuf::from("/p/main.rs"));
+        assert_eq!(e.unsaved_contents.as_deref(), Some("dirty buffer text"));
+    }
+
+    /// Same STRICT schema with NULL contents (the common case: 542/550 rows in
+    /// live data) must surface the file with `unsaved_contents == None`.
+    #[test]
+    fn null_contents_in_strict_table_yields_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
+                 timestamp TEXT, session_id TEXT);
+             CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
+             CREATE TABLE editors (
+                 item_id INTEGER NOT NULL, workspace_id INTEGER NOT NULL,
+                 path BLOB, contents TEXT
+             ) STRICT;
+             CREATE TABLE editor_selections (
+                 item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
+                 start INTEGER, \"end\" INTEGER
+             );
+             INSERT INTO workspaces VALUES (1, '/p', '2026-06-09 01:00:00', 'S');
+             INSERT INTO items VALUES (1, 1, 'Editor', 1);
+             INSERT INTO editors (item_id, workspace_id, path, contents)
+                 VALUES (1, 1, CAST('/p/main.rs' AS BLOB), NULL);",
+        )
+        .unwrap();
+        let e = active_editor_for_cwd(&conn, Path::new("/p"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.unsaved_contents, None);
     }
 }
