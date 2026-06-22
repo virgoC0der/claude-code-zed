@@ -58,10 +58,11 @@ jobs:
           TAP_REPO: virgoC0der/homebrew-tap
           FORMULA_PATH: Formula/zed-claude-bridge.rb
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"   # v0.2.1 -> 0.2.1
+          VERSION="${GITHUB_REF_NAME#v}"   # v0.2.2 -> 0.2.2
           ARM_SHA=$(awk '/aarch64-apple-darwin/{print $1}' dist/checksums.txt)
           X86_SHA=$(awk '/x86_64-apple-darwin/{print $1}'  dist/checksums.txt)
-          if [ -z "$ARM_SHA" ] || [ -z "$X86_SHA" ]; then
+          if ! printf '%s' "$ARM_SHA" | grep -qE '^[0-9a-f]{64}$' \
+             || ! printf '%s' "$X86_SHA" | grep -qE '^[0-9a-f]{64}$'; then
             echo "::error::could not extract both sha256 values from dist/checksums.txt"; exit 1
           fi
 
@@ -70,8 +71,11 @@ jobs:
 
           # version "X.Y.Z"
           sed -i '' -E "s/^  version \".*\"/  version \"${VERSION}\"/" "$F"
-          # Replace the two sha256 lines in order: arm64 then x86_64.
-          perl -0pi -e "BEGIN{@s=(\$ENV{ARM_SHA},\$ENV{X86_SHA}); \$i=0} s/sha256 \"[0-9a-f]{64}\"/'sha256 \"'.\$s[\$i++].'\"'/ge" "$F"
+          # Rewrite each sha256 on the line that follows its arch-specific url.
+          # Anchoring on the url line (not a pre-existing 64-hex value) means an
+          # empty/stale sha256 is still replaced. Runs on GNU & BSD sed alike.
+          sed -i '' -E "/aarch64-apple-darwin\.tar\.gz/{n;s|sha256 \"[^\"]*\"|sha256 \"${ARM_SHA}\"|;}" "$F"
+          sed -i '' -E "/x86_64-apple-darwin\.tar\.gz/{n;s|sha256 \"[^\"]*\"|sha256 \"${X86_SHA}\"|;}" "$F"
 
           cd tap
           if git diff --quiet; then
