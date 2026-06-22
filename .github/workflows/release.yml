@@ -46,3 +46,38 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
+
+      # Push the new version + per-arch sha256 into the homebrew-tap formula.
+      # Reuses dist/checksums.txt computed above — no re-download, no re-hash.
+      # The formula lists the arm64 sha256 first and x86_64 second; the two
+      # awk/perl steps below preserve that order.
+      - name: Bump homebrew-tap formula
+        env:
+          # Fine-grained PAT with Contents:write on virgoC0der/homebrew-tap.
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          TAP_REPO: virgoC0der/homebrew-tap
+          FORMULA_PATH: Formula/zed-claude-bridge.rb
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"   # v0.2.1 -> 0.2.1
+          ARM_SHA=$(awk '/aarch64-apple-darwin/{print $1}' dist/checksums.txt)
+          X86_SHA=$(awk '/x86_64-apple-darwin/{print $1}'  dist/checksums.txt)
+          if [ -z "$ARM_SHA" ] || [ -z "$X86_SHA" ]; then
+            echo "::error::could not extract both sha256 values from dist/checksums.txt"; exit 1
+          fi
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          F="tap/${FORMULA_PATH}"
+
+          # version "X.Y.Z"
+          sed -i '' -E "s/^  version \".*\"/  version \"${VERSION}\"/" "$F"
+          # Replace the two sha256 lines in order: arm64 then x86_64.
+          perl -0pi -e "BEGIN{@s=(\$ENV{ARM_SHA},\$ENV{X86_SHA}); \$i=0} s/sha256 \"[0-9a-f]{64}\"/'sha256 \"'.\$s[\$i++].'\"'/ge" "$F"
+
+          cd tap
+          if git diff --quiet; then
+            echo "formula already up to date for ${VERSION}"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "zed-claude-bridge ${VERSION}"
+          git push
