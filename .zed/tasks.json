@@ -1,7 +1,7 @@
 [
   {
     "label": "Send selection to Claude Code",
-    "command": "/Users/sx.chen/.local/bin/zed-claude-bridge ipc-send-at-mention --workspace \"$HOME\" --workspace-root \"$WSR\" --file-path \"$FP\" --cursor-row \"$ROW\" --text \"$TEXT\"",
+    "command": "/opt/homebrew/bin/zed-claude-bridge ipc-send-at-mention --workspace \"$HOME\" --workspace-root \"$WSR\" --file-path \"$FP\" --cursor-row \"$ROW\" --text \"$TEXT\"",
     "env": {
       "FP": "$ZED_FILE",
       "ROW": "$ZED_ROW",
