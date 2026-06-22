@@ -407,7 +407,7 @@ mod tests {
             "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
                  timestamp TEXT, session_id TEXT);
              CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
-             CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB, contents BLOB);
+             CREATE TABLE editors (item_id INTEGER, workspace_id INTEGER, path BLOB, contents TEXT);
              CREATE TABLE editor_selections (
                  item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
                  start INTEGER, \"end\" INTEGER
