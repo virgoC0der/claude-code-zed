@@ -73,8 +73,11 @@ pub fn active_editor_for_cwd(
     let rows = stmt.query_map([&session], |row| {
         let paths: Option<String> = row.get(0)?;
         // editors.path is a BLOB: read as bytes and decode lossily (a
-        // TEXT-literal SQL comparison would silently match nothing).
-        let active: Vec<u8> = row.get(1)?;
+        // TEXT-literal SQL comparison would silently match nothing). It is
+        // NULL for fileless active editors (untitled buffers, settings/JSON
+        // views with no backing file); those rows are skipped below — reading
+        // them as a non-Option Vec<u8> raised `Invalid column type Null`.
+        let active: Option<Vec<u8>> = row.get(1)?;
         let start: Option<i64> = row.get(2)?;
         let end: Option<i64> = row.get(3)?;
         // editors.contents is declared TEXT in Zed's STRICT schema, so a
@@ -87,6 +90,11 @@ pub fn active_editor_for_cwd(
     for row in rows {
         let (paths, active_bytes, start, end, contents) = row?;
         let Some(paths) = paths else { continue };
+        // NULL path => a fileless active editor (untitled/settings view); not a
+        // file we can report, so skip to the next candidate row.
+        let Some(active_bytes) = active_bytes else {
+            continue;
+        };
         if cwd_matches_worktree(&cwd_str, &paths) {
             let active = String::from_utf8_lossy(&active_bytes).to_string();
             if active.is_empty() {
@@ -375,5 +383,78 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(e.unsaved_contents, None);
+    }
+
+    /// Live Zed stores `editors.path` as a nullable BLOB (8/563 rows NULL in
+    /// the observed DB); a fileless active editor (untitled buffer, settings/
+    /// JSON view with no backing file) can surface a NULL path through the
+    /// INNER JOIN. Reading it as a non-Option `Vec<u8>` raised `Invalid column
+    /// type Null at index: 1, name: path`, failing the whole query for that
+    /// client and silently dropping its active-file awareness. A NULL-path row
+    /// must be skipped, not fatal: a sibling workspace with a real matching
+    /// path is still returned.
+    #[test]
+    fn null_path_active_editor_is_skipped_not_errored() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
+                 timestamp TEXT, session_id TEXT);
+             CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
+             CREATE TABLE editors (
+                 item_id INTEGER NOT NULL, workspace_id INTEGER NOT NULL,
+                 path BLOB, contents TEXT
+             ) STRICT;
+             CREATE TABLE editor_selections (
+                 item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
+                 start INTEGER, \"end\" INTEGER
+             );
+             -- Workspace 1: longer paths so it sorts first under
+             -- `ORDER BY length(w.paths) DESC`; its active editor is a
+             -- fileless JSON view -> path IS NULL. Before the fix the query
+             -- errors here for the whole client.
+             INSERT INTO workspaces VALUES (1, '/proj/settings', '2026-06-09 01:00:00', 'S');
+             INSERT INTO items VALUES (1, 1, 'Editor', 1);
+             INSERT INTO editors (item_id, workspace_id, path, contents)
+                 VALUES (1, 1, NULL, NULL);
+             -- Workspace 2: a real file whose worktree matches the cwd.
+             INSERT INTO workspaces VALUES (2, '/proj', '2026-06-09 02:00:00', 'S');
+             INSERT INTO items VALUES (2, 2, 'Editor', 1);
+             INSERT INTO editors (item_id, workspace_id, path, contents)
+                 VALUES (2, 2, CAST('/proj/main.rs' AS BLOB), NULL);",
+        )
+        .unwrap();
+        let e = active_editor_for_cwd(&conn, Path::new("/proj"))
+            .unwrap()
+            .expect("NULL-path row must be skipped, not fatal; real file returned");
+        assert_eq!(e.path, PathBuf::from("/proj/main.rs"));
+    }
+
+    /// When the only matching active editor has `path IS NULL`, there is no
+    /// file to report: return `Ok(None)`, never an `Err`.
+    #[test]
+    fn only_null_path_active_editor_yields_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (workspace_id INTEGER PRIMARY KEY, paths TEXT,
+                 timestamp TEXT, session_id TEXT);
+             CREATE TABLE items (item_id INTEGER, workspace_id INTEGER, kind TEXT, active INTEGER);
+             CREATE TABLE editors (
+                 item_id INTEGER NOT NULL, workspace_id INTEGER NOT NULL,
+                 path BLOB, contents TEXT
+             ) STRICT;
+             CREATE TABLE editor_selections (
+                 item_id INTEGER, editor_id INTEGER, workspace_id INTEGER,
+                 start INTEGER, \"end\" INTEGER
+             );
+             INSERT INTO workspaces VALUES (1, '/proj', '2026-06-09 01:00:00', 'S');
+             INSERT INTO items VALUES (1, 1, 'Editor', 1);
+             INSERT INTO editors (item_id, workspace_id, path, contents)
+                 VALUES (1, 1, NULL, NULL);",
+        )
+        .unwrap();
+        assert_eq!(
+            active_editor_for_cwd(&conn, Path::new("/proj")).unwrap(),
+            None
+        );
     }
 }
