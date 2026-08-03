@@ -22,8 +22,24 @@ use crate::protocol::{
     Response, ServerCapabilities, ServerInfo, ToolsCapability, ToolsListResult, error_code,
 };
 
-/// MCP protocol version this server speaks.
+/// Default MCP protocol version, used when the client asks for one we
+/// do not recognise.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// MCP protocol revisions this server can speak.
+///
+/// The server's wire behaviour is identical across these revisions —
+/// it only implements `initialize`, `ping`, `tools/list` and
+/// `tools/call`, whose shapes are unchanged. So the negotiated value
+/// is whatever the client asked for, provided it is on this list.
+///
+/// This matters because the MCP lifecycle spec says of the server's
+/// `initialize` reply: *"This may not match the version that the
+/// client requested. If the client cannot support this version, it
+/// MUST disconnect."* Claude Code 2.1.220 requests `2025-06-18`;
+/// answering with a hardcoded `2024-11-05` made it hang up a few
+/// milliseconds after connecting.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 /// Server display name used in `initialize` `serverInfo.name`.
 pub const SERVER_NAME: &str = "zed-claude-bridge";
@@ -54,12 +70,15 @@ pub enum McpResponse {
 /// `tools/call` yield `-32602`.
 pub fn dispatch(state: &EditorState, req: Request) -> McpResponse {
     match req.method.as_str() {
-        "initialize" => McpResponse::Reply(Response::success(
-            req.id,
-            initialize_result()
-                .and_then(|v| serde_json::to_value(v).ok())
-                .unwrap_or(Value::Null),
-        )),
+        "initialize" => {
+            let negotiated = negotiate_protocol_version(req.params.as_ref());
+            McpResponse::Reply(Response::success(
+                req.id,
+                initialize_result(negotiated)
+                    .and_then(|v| serde_json::to_value(v).ok())
+                    .unwrap_or(Value::Null),
+            ))
+        }
         "notifications/initialized" => McpResponse::NoReply,
         "ping" => McpResponse::Reply(Response::success(req.id, json!({}))),
         "tools/list" => McpResponse::Reply(Response::success(req.id, tools_list_value())),
@@ -75,9 +94,27 @@ pub fn dispatch(state: &EditorState, req: Request) -> McpResponse {
     }
 }
 
-fn initialize_result() -> Option<InitializeResult> {
+/// Pick the protocol version to answer `initialize` with.
+///
+/// Echoes `params.protocolVersion` when it is one we support;
+/// otherwise falls back to [`PROTOCOL_VERSION`], which lets the client
+/// decide whether to proceed or disconnect (per the lifecycle spec).
+fn negotiate_protocol_version(params: Option<&Value>) -> &'static str {
+    params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .and_then(|requested| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == requested)
+                .copied()
+        })
+        .unwrap_or(PROTOCOL_VERSION)
+}
+
+fn initialize_result(protocol_version: &str) -> Option<InitializeResult> {
     Some(InitializeResult {
-        protocol_version: PROTOCOL_VERSION.to_string(),
+        protocol_version: protocol_version.to_string(),
         capabilities: ServerCapabilities {
             tools: Some(ToolsCapability {
                 list_changed: false,
@@ -247,6 +284,41 @@ mod tests {
         assert_eq!(v["serverInfo"]["name"], "zed-claude-bridge");
         // version string must match cargo's pkg version
         assert_eq!(v["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn initialize_echoes_supported_client_protocol_version() {
+        // Claude Code 2.1.220 negotiates "2025-06-18". Per the MCP
+        // lifecycle spec, when the server replies with a version the
+        // client cannot support the client MUST disconnect — which is
+        // exactly the immediate-drop symptom this guards against.
+        let state = EditorState::new();
+        for requested in SUPPORTED_PROTOCOL_VERSIONS {
+            let resp = dispatch(
+                &state,
+                req(
+                    1,
+                    "initialize",
+                    Some(json!({ "protocolVersion": requested })),
+                ),
+            );
+            let v = ok_value(resp);
+            assert_eq!(
+                v["protocolVersion"], *requested,
+                "server must echo the client's requested version when supported"
+            );
+        }
+    }
+
+    #[test]
+    fn initialize_falls_back_to_default_for_unknown_client_version() {
+        let state = EditorState::new();
+        let resp = dispatch(
+            &state,
+            req(1, "initialize", Some(json!({"protocolVersion": "1.0.0"}))),
+        );
+        let v = ok_value(resp);
+        assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
     }
 
     #[test]

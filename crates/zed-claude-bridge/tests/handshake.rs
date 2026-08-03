@@ -119,6 +119,67 @@ async fn connect_with_token(
 }
 
 // ---------------------------------------------------------------------------
+// Subprotocol negotiation
+// ---------------------------------------------------------------------------
+
+/// Claude Code sends `Sec-WebSocket-Protocol: mcp` on the upgrade
+/// request. RFC 6455 §4.1 requires the client to fail the connection
+/// if the server's 101 response does not echo one of the offered
+/// subprotocols, so omitting it makes Claude hang up immediately after
+/// the upgrade — before `initialize` is ever sent.
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_subprotocol_is_echoed_in_handshake_response() {
+    let (addr, _t) = start_transport().await;
+    let stream = TcpStream::connect(&addr).await.expect("tcp connect");
+    let url = format!("ws://{addr}/");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "x-claude-code-ide-authorization",
+        HeaderValue::from_str(TEST_TOKEN).unwrap(),
+    );
+    req.headers_mut()
+        .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("mcp"));
+
+    let (_ws, resp) = tokio_tungstenite::client_async(req, stream)
+        .await
+        .expect("client handshake");
+
+    let negotiated = resp
+        .headers()
+        .get("sec-websocket-protocol")
+        .map(|v| v.to_str().unwrap_or_default().to_owned());
+    assert_eq!(
+        negotiated.as_deref(),
+        Some("mcp"),
+        "server must echo the `mcp` subprotocol the client offered"
+    );
+}
+
+/// A client that offers no subprotocol must still get a clean upgrade,
+/// and the server must not invent a `Sec-WebSocket-Protocol` header
+/// (RFC 6455 forbids returning one that wasn't offered).
+#[tokio::test(flavor = "current_thread")]
+async fn no_subprotocol_offered_yields_no_subprotocol_header() {
+    let (addr, _t) = start_transport().await;
+    let stream = TcpStream::connect(&addr).await.expect("tcp connect");
+    let url = format!("ws://{addr}/");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "x-claude-code-ide-authorization",
+        HeaderValue::from_str(TEST_TOKEN).unwrap(),
+    );
+
+    let (_ws, resp) = tokio_tungstenite::client_async(req, stream)
+        .await
+        .expect("client handshake");
+
+    assert!(
+        resp.headers().get("sec-websocket-protocol").is_none(),
+        "server must not echo a subprotocol that was never offered"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Auth gate
 // ---------------------------------------------------------------------------
 

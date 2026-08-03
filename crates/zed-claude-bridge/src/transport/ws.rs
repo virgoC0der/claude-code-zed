@@ -20,6 +20,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Instant, sleep};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -42,6 +43,13 @@ pub const AUTH_HEADER: &str = "x-claude-code-ide-authorization";
 /// the `protocol` capability's **WebSocket workspace request header**
 /// requirement.
 pub const WORKSPACE_HEADER: &str = "x-claude-code-workspace";
+
+/// Standard WebSocket subprotocol negotiation header (RFC 6455 §4.1).
+pub const SUBPROTOCOL_HEADER: &str = "sec-websocket-protocol";
+
+/// The subprotocol Claude Code offers on the upgrade request. Echoed
+/// back verbatim when present; see the handshake callback for why.
+pub const MCP_SUBPROTOCOL: &str = "mcp";
 
 /// Lower bound (inclusive) of the port range we pick from.
 pub const MIN_PORT: u16 = 10_000;
@@ -444,6 +452,30 @@ impl Transport {
                             }
                         }
                     }
+                }
+
+                // Echo back the `mcp` subprotocol when the client offers
+                // it. Claude Code sends `Sec-WebSocket-Protocol: mcp`, and
+                // RFC 6455 §4.1 requires a client to fail the connection if
+                // the server's 101 omits a subprotocol it offered — which
+                // showed up as a clean EOF a few milliseconds after the
+                // upgrade, before `initialize` was ever sent. We only ever
+                // echo a value the client actually listed; returning one
+                // that was not offered is likewise a protocol violation.
+                let offered_mcp = req
+                    .headers()
+                    .get_all(SUBPROTOCOL_HEADER)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .flat_map(|v| v.split(','))
+                    .any(|p| p.trim().eq_ignore_ascii_case(MCP_SUBPROTOCOL));
+
+                let mut response = response;
+                if offered_mcp {
+                    response.headers_mut().insert(
+                        SUBPROTOCOL_HEADER,
+                        HeaderValue::from_static(MCP_SUBPROTOCOL),
+                    );
                 }
 
                 // Always accept the upgrade so we can send a WS close frame
